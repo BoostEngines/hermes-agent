@@ -45,7 +45,9 @@ def event(**overrides):
         event_id="event-7",
         event_type="card.action.trigger",
         tenant_key="tenant-7",
-        create_time=str(int(NOW * 1_000)),
+        # Feishu P2 callback headers use microseconds, for example
+        # create_time="1603977298000000" in the official card callback docs.
+        create_time=str(int(NOW * 1_000_000)),
     )
     operator = types.SimpleNamespace(open_id="operator-7")
     context = types.SimpleNamespace(
@@ -174,6 +176,17 @@ class VerifiedNormalizationTest(unittest.TestCase):
             "delayed-update-token",
             json.dumps(body, sort_keys=True),
         )
+
+    def test_normalizes_numeric_timestamp_precisions_and_rejects_overflow(self):
+        expected = MODULE._iso_utc(NOW)
+        for multiplier in (1, 1_000, 1_000_000, 1_000_000_000):
+            timestamp, normalized = MODULE._parse_occurred_at(
+                str(int(NOW * multiplier))
+            )
+            self.assertEqual(timestamp, NOW)
+            self.assertEqual(normalized, expected)
+        with self.assertRaises(MODULE.ApprovalBoundaryError):
+            MODULE._parse_occurred_at("9" * 40)
 
     def test_missing_operator_wrong_tenant_and_expired_event_fail_closed(self):
         calls = []

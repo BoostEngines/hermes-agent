@@ -105,8 +105,18 @@ def _parse_occurred_at(value: Any) -> tuple[float, str]:
     text = _required_text(value, "occurred_at")
     if text.isdigit():
         numeric = float(text)
-        timestamp = numeric / 1_000 if numeric > 10_000_000_000 else numeric
-        return timestamp, _iso_utc(timestamp)
+        if numeric >= 100_000_000_000_000_000:
+            timestamp = numeric / 1_000_000_000
+        elif numeric >= 100_000_000_000_000:
+            timestamp = numeric / 1_000_000
+        elif numeric >= 100_000_000_000:
+            timestamp = numeric / 1_000
+        else:
+            timestamp = numeric
+        try:
+            return timestamp, _iso_utc(timestamp)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ApprovalBoundaryError("invalid_occurred_at") from exc
     try:
         normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
         parsed = datetime.fromisoformat(normalized)
