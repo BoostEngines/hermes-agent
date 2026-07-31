@@ -143,6 +143,10 @@ from gateway.platforms.base import (
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
+from plugins.platforms.feishu.datahub_verified_approval import (
+    DataHubVerifiedApprovalHandler,
+    owns_datahub_action_value,
+)
 from utils import atomic_json_write, env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -1502,6 +1506,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
+        self._datahub_verified_approval = (
+            DataHubVerifiedApprovalHandler.from_environment()
+        )
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
@@ -2675,6 +2682,9 @@ class FeishuAdapter(BasePlatformAdapter):
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
+        if owns_datahub_action_value(action_value):
+            return self._handle_datahub_verified_approval(data, action_value)
+
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
         update_prompt_action = (
             action_value.get("hermes_update_prompt_action")
@@ -2694,6 +2704,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if P2CardActionTriggerResponse is None:
             return None
         return P2CardActionTriggerResponse()
+
+    def _handle_datahub_verified_approval(
+        self,
+        data: Any,
+        action_value: Any,
+    ) -> Any:
+        """Handle DataHub approval synchronously without model dispatch."""
+        result = self._datahub_verified_approval.handle(data, action_value)
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if CallBackCard is not None:
+            card = CallBackCard()
+            card.type = "raw"
+            card.data = result.card
+            response.card = card
+        return response
 
     @staticmethod
     def _loop_accepts_callbacks(loop: Any) -> bool:

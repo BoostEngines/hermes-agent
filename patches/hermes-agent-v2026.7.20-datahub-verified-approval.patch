@@ -1,0 +1,44 @@
+From: DataHub reviewed Hermes fork overlay
+Base-Commit: 3ef6bbd201263d354fd83ec55b3c306ded2eb72a
+Subject: [PATCH] feishu: intercept verified DataHub approvals before model routing
+
+--- a/plugins/platforms/feishu/adapter.py
++++ b/plugins/platforms/feishu/adapter.py
+@@ -145,0 +146,4 @@
++from plugins.platforms.feishu.datahub_verified_approval import (
++    DataHubVerifiedApprovalHandler,
++    owns_datahub_action_value,
++)
+@@ -1504,0 +1509,3 @@
++        self._datahub_verified_approval = (
++            DataHubVerifiedApprovalHandler.from_environment()
++        )
+@@ -2669,0 +2677,6 @@
++        event = getattr(data, "event", None)
++        action = getattr(event, "action", None)
++        action_value = getattr(action, "value", {}) or {}
++        if owns_datahub_action_value(action_value):
++            return self._handle_datahub_verified_approval(data, action_value)
++
+@@ -2675,3 +2687,0 @@
+-        event = getattr(data, "event", None)
+-        action = getattr(event, "action", None)
+-        action_value = getattr(action, "value", {}) or {}
+@@ -2697,0 +2708,17 @@
++    def _handle_datahub_verified_approval(
++        self,
++        data: Any,
++        action_value: Any,
++    ) -> Any:
++        """Handle DataHub approval synchronously without model dispatch."""
++        result = self._datahub_verified_approval.handle(data, action_value)
++        if P2CardActionTriggerResponse is None:
++            return None
++        response = P2CardActionTriggerResponse()
++        if CallBackCard is not None:
++            card = CallBackCard()
++            card.type = "raw"
++            card.data = result.card
++            response.card = card
++        return response
++
