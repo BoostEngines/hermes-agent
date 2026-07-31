@@ -64,7 +64,10 @@ def _make_card_action_data(
     return SimpleNamespace(
         event=SimpleNamespace(
             token=token,
-            context=SimpleNamespace(open_chat_id=chat_id),
+            context=SimpleNamespace(
+                open_chat_id=chat_id,
+                open_message_id="om_approval_report",
+            ),
             operator=SimpleNamespace(open_id=open_id),
             action=SimpleNamespace(
                 tag="button",
@@ -549,6 +552,29 @@ class TestCardActionCallbackResponse:
         assert response is not None
         assert response.card is None
 
+    def test_datahub_approval_preserves_original_card_and_schedules_thread_reply(
+        self,
+        _patch_callback_card_types,
+    ):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._datahub_verified_approval.handle = MagicMock(return_value=SimpleNamespace(
+            state="committed",
+            reply_text="审批已记录",
+        ))
+        data = _make_card_action_data({
+            "schemaVersion": "datahub.ops.approval-card-action.v1",
+            "actionId": "123e4567-e89b-42d3-a456-426614174000",
+        })
+
+        with patch.object(adapter, "_submit_on_loop", return_value=True) as submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is None
+        submit.assert_called_once()
+        submit.call_args.args[1].close()
     def test_falls_back_to_open_id_when_name_not_cached(self, _patch_callback_card_types):
         adapter = _make_adapter()
         adapter._loop = MagicMock()
@@ -802,6 +828,62 @@ class TestCardActionCallbackResponse:
         assert response.card is None
         assert 8 in adapter._update_prompt_state
         mock_submit.assert_not_called()
+
+
+class TestDataHubConversationApproval:
+    @pytest.mark.asyncio
+    async def test_explicit_bulk_command_bypasses_model_and_uses_verified_boundary(self):
+        adapter = _make_adapter()
+        message = SimpleNamespace(
+            message_id="om_command",
+            chat_id="oc_12345",
+            parent_id=None,
+            upper_message_id=None,
+            root_id=None,
+        )
+        data = SimpleNamespace(
+            header=SimpleNamespace(event_type="im.message.receive_v1"),
+            event=SimpleNamespace(message=message),
+        )
+        sender_id = SimpleNamespace(open_id="ou_user1")
+        with (
+            patch.object(
+                adapter,
+                "_extract_message_content",
+                new_callable=AsyncMock,
+                return_value=(
+                    "帮我合入所有 PR",
+                    feishu_module.MessageType.TEXT,
+                    [],
+                    [],
+                    [],
+                ),
+            ),
+            patch.object(
+                adapter,
+                "_handle_datahub_conversation_approval",
+                new_callable=AsyncMock,
+            ) as conversation,
+            patch.object(
+                adapter,
+                "_handle_message_with_guards",
+                new_callable=AsyncMock,
+            ) as model_dispatch,
+        ):
+            await adapter._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=sender_id,
+                chat_type="group",
+                message_id="om_command",
+            )
+
+        conversation.assert_awaited_once_with(
+            data=data,
+            message=message,
+            text="帮我合入所有 PR",
+        )
+        model_dispatch.assert_not_awaited()
 
 
 class TestResolveUpdatePrompt:

@@ -145,6 +145,7 @@ from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 from plugins.platforms.feishu.datahub_verified_approval import (
     DataHubVerifiedApprovalHandler,
+    looks_like_datahub_approval_command,
     owns_datahub_action_value,
 )
 from utils import atomic_json_write, env_float, env_int
@@ -2710,17 +2711,78 @@ class FeishuAdapter(BasePlatformAdapter):
         data: Any,
         action_value: Any,
     ) -> Any:
-        """Handle DataHub approval synchronously without model dispatch."""
+        """Handle DataHub approval without replacing the engineer report card."""
+        event = getattr(data, "event", None)
+        token = str(getattr(event, "token", "") or "")
+        if token and self._is_card_action_duplicate(token):
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         result = self._datahub_verified_approval.handle(data, action_value)
+        context = getattr(event, "context", None)
+        chat_id = str(getattr(context, "open_chat_id", "") or "")
+        message_id = str(getattr(context, "open_message_id", "") or "")
+        loop = self._loop
+        if chat_id and message_id and self._loop_accepts_callbacks(loop):
+            self._submit_on_loop(
+                loop,
+                self._reply_datahub_approval_result(
+                    chat_id=chat_id,
+                    reply_to_message_id=message_id,
+                    thread_id=message_id,
+                    text=result.reply_text,
+                ),
+            )
         if P2CardActionTriggerResponse is None:
             return None
-        response = P2CardActionTriggerResponse()
-        if CallBackCard is not None:
-            card = CallBackCard()
-            card.type = "raw"
-            card.data = result.card
-            response.card = card
-        return response
+        # Returning an empty callback response preserves the original card.
+        # The durable human-facing outcome is sent as a thread reply above.
+        return P2CardActionTriggerResponse()
+
+    async def _reply_datahub_approval_result(
+        self,
+        *,
+        chat_id: str,
+        reply_to_message_id: str,
+        thread_id: str,
+        text: str,
+    ) -> None:
+        if not self._client:
+            logger.warning("[Feishu] Cannot reply with DataHub approval result: not connected")
+            return
+        payload = json.dumps({"text": text}, ensure_ascii=False)
+        response = await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="text",
+            payload=payload,
+            reply_to=reply_to_message_id,
+            metadata={"thread_id": thread_id},
+        )
+        if not self._response_succeeded(response):
+            logger.warning("[Feishu] Failed to send DataHub approval thread reply")
+
+    async def _handle_datahub_conversation_approval(
+        self,
+        *,
+        data: Any,
+        message: Any,
+        text: str,
+    ) -> None:
+        result = await self._run_blocking(
+            self._datahub_verified_approval.handle_conversation,
+            data,
+            text,
+        )
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        root_id = str(getattr(message, "root_id", "") or "")
+        parent_id = str(getattr(message, "parent_id", "") or "")
+        thread_id = root_id or parent_id or message_id
+        if chat_id and message_id:
+            await self._reply_datahub_approval_result(
+                chat_id=chat_id,
+                reply_to_message_id=message_id,
+                thread_id=thread_id,
+                text=result.reply_text,
+            )
 
     @staticmethod
     def _loop_accepts_callbacks(loop: Any) -> bool:
@@ -3293,6 +3355,27 @@ class FeishuAdapter(BasePlatformAdapter):
             if text.startswith("/"):
                 inbound_type = MessageType.COMMAND
 
+        parent_message_id = (
+            getattr(message, "parent_id", None)
+            or getattr(message, "upper_message_id", None)
+            or getattr(message, "root_id", None)
+            or None
+        )
+        if (
+            not is_bot
+            and inbound_type == MessageType.TEXT
+            and looks_like_datahub_approval_command(
+                text,
+                has_reply_context=bool(parent_message_id),
+            )
+        ):
+            await self._handle_datahub_conversation_approval(
+                data=data,
+                message=message,
+                text=text,
+            )
+            return
+
         # Guard runs post-strip so a pure "@Bot" message (stripped to "") is dropped.
         if inbound_type == MessageType.TEXT and not text and not media_urls:
             logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
@@ -3304,12 +3387,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 text = f"{hint}\n\n{text}" if text else hint
 
         thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
-        reply_to_message_id = (
-            getattr(message, "parent_id", None)
-            or getattr(message, "upper_message_id", None)
-            or getattr(message, "root_id", None)
-            or None
-        )
+        reply_to_message_id = parent_message_id
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
 
         sender_primary = (

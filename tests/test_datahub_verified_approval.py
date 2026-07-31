@@ -67,6 +67,34 @@ def event(**overrides):
     return payload
 
 
+def message_event(
+    *,
+    text="帮我合入所有 PR",
+    parent_id=None,
+    root_id=None,
+):
+    return types.SimpleNamespace(
+        header=types.SimpleNamespace(
+            event_id="message-event-7",
+            event_type="im.message.receive_v1",
+            tenant_key="tenant-7",
+            create_time=str(int(NOW * 1_000_000)),
+        ),
+        event=types.SimpleNamespace(
+            sender=types.SimpleNamespace(
+                sender_id=types.SimpleNamespace(open_id="operator-7")
+            ),
+            message=types.SimpleNamespace(
+                chat_id="chat-7",
+                message_id="command-message-7",
+                parent_id=parent_id,
+                root_id=root_id,
+                content=json.dumps({"text": text}, ensure_ascii=False),
+            ),
+        ),
+    )
+
+
 def receipt(**overrides):
     value = {
         "schemaVersion": MODULE.RECEIPT_SCHEMA,
@@ -276,6 +304,82 @@ class DecisionTransportTest(unittest.TestCase):
         self.assertNotIn("已记录", json.dumps(result.card, ensure_ascii=False))
 
 
+class ConversationApprovalTest(unittest.TestCase):
+    def test_claims_only_explicit_commands(self):
+        self.assertTrue(
+            MODULE.looks_like_datahub_approval_command(
+                "帮我合入所有 PR", has_reply_context=False
+            )
+        )
+        self.assertTrue(
+            MODULE.looks_like_datahub_approval_command(
+                "同意合入", has_reply_context=True
+            )
+        )
+        self.assertTrue(
+            MODULE.looks_like_datahub_approval_command(
+                "同意合入 PR #380", has_reply_context=False
+            )
+        )
+        self.assertFalse(
+            MODULE.looks_like_datahub_approval_command(
+                "这个 PR 看起来怎么样", has_reply_context=True
+            )
+        )
+        self.assertFalse(
+            MODULE.looks_like_datahub_approval_command(
+                "同意合入", has_reply_context=False
+            )
+        )
+
+    def test_normalizes_verified_message_and_validates_receipt(self):
+        calls = []
+
+        def transport(url, token, body, timeout):
+            calls.append((url, token, body, timeout))
+            return {
+                "schemaVersion": MODULE.CONVERSATION_RECEIPT_SCHEMA,
+                "decision": "approve",
+                "selector": "all_pending_pull_requests",
+                "matchedCount": 3,
+                "acceptedCount": 3,
+                "results": [{"actionId": ACTION_ID}],
+            }
+
+        result = handler(transport).handle_conversation(
+            message_event(), "帮我合入所有 PR"
+        )
+
+        self.assertEqual(result.state, "committed")
+        self.assertIn("3 个修复 PR", result.reply_text)
+        self.assertEqual(
+            calls[0][0],
+            "https://datahub.example.invalid/api/ops/v1/conversation-decisions",
+        )
+        body = calls[0][2]
+        self.assertEqual(body["schemaVersion"], MODULE.CONVERSATION_SCHEMA)
+        self.assertEqual(body["event"]["eventType"], "im.message.receive_v1")
+        self.assertEqual(body["event"]["principalOpenId"], "operator-7")
+        self.assertEqual(body["commandText"], "帮我合入所有 PR")
+
+    def test_reply_context_is_preserved_and_failures_do_not_claim_success(self):
+        calls = []
+
+        def transport(url, token, body, timeout):
+            calls.append(body)
+            raise MODULE.DecisionTransportError(403, uncertain=False)
+
+        result = handler(transport).handle_conversation(
+            message_event(parent_id="approval-card-7", root_id="approval-card-7"),
+            "同意合入",
+        )
+        self.assertEqual(result.state, "rejected")
+        self.assertNotIn("已批准", result.reply_text)
+        self.assertEqual(
+            calls[0]["event"]["parentMessageId"], "approval-card-7"
+        )
+
+
 class ForkPatchContractTest(unittest.TestCase):
     def test_patch_intercepts_before_hermes_and_generic_model_paths(self):
         patch = (
@@ -287,15 +391,24 @@ class ForkPatchContractTest(unittest.TestCase):
             "Base-Commit: 3ef6bbd201263d354fd83ec55b3c306ded2eb72a",
             patch,
         )
-        intercept = patch.index("+        if owns_datahub_action_value(action_value):")
-        original_extraction = patch.index(
-            "-        event = getattr(data, \"event\", None)"
+        self.assertIn(
+            "+        if owns_datahub_action_value(action_value):",
+            patch,
         )
-        self.assertLess(intercept, original_extraction)
         self.assertIn(
             "return self._handle_datahub_verified_approval(data, action_value)",
             patch,
         )
+        adapter = (
+            ROOT / "plugins" / "platforms" / "feishu" / "adapter.py"
+        ).read_text()
+        intercept = adapter.index("if owns_datahub_action_value(action_value):")
+        hermes_dispatch = adapter.index("if hermes_action:", intercept)
+        generic_dispatch = adapter.index(
+            "self._handle_card_action_event(data)", intercept
+        )
+        self.assertLess(intercept, hermes_dispatch)
+        self.assertLess(intercept, generic_dispatch)
 
 
 if __name__ == "__main__":

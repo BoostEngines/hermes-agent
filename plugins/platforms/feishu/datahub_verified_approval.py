@@ -27,6 +27,11 @@ ACTION_NAMESPACE = "datahub.ops.approval-card-action."
 VERIFIED_EVENT_SCHEMA = "datahub.ops.verified-feishu-card-action.v1"
 DECISION_SCHEMA = "datahub.ops.feishu-action-decision.v1"
 RECEIPT_SCHEMA = "datahub.ops.feishu-action-decision-receipt.v1"
+CONVERSATION_SCHEMA = "datahub.ops.feishu-conversation-decision.v1"
+CONVERSATION_EVENT_SCHEMA = "datahub.ops.verified-feishu-message.v1"
+CONVERSATION_RECEIPT_SCHEMA = (
+    "datahub.ops.feishu-conversation-decision-receipt.v1"
+)
 DECISIONS = frozenset({"approve", "reject", "cancel"})
 _CHALLENGE_RE = re.compile(r"^v1\.[A-Za-z0-9_-]{32}\.[A-Za-z0-9_-]{32}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -54,6 +59,13 @@ class DecisionTransportError(ApprovalBoundaryError):
 class ApprovalCallbackResult:
     state: str
     card: Mapping[str, Any]
+    reply_text: str
+
+
+@dataclass(frozen=True)
+class ConversationApprovalResult:
+    state: str
+    reply_text: str
 
 
 DecisionTransport = Callable[
@@ -93,6 +105,36 @@ def owns_datahub_action_value(value: Any) -> bool:
     decoded = _parse_action_value(value)
     schema = decoded.get("schemaVersion") if decoded else None
     return isinstance(schema, str) and schema.startswith(ACTION_NAMESPACE)
+
+
+def _normalized_command_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+_REPLY_COMMAND_RE = re.compile(
+    r"^(?:(?:请|麻烦)?(?:帮我)?(?:同意|批准|确认)?(?:合入|合并)(?:这个|该)?(?:\s*pr)?|同意|批准|确认|可以合入|拒绝|不同意)[。！!？?]?$",
+    re.IGNORECASE,
+)
+_EXPLICIT_COMMAND_RE = re.compile(
+    r"^(?:请|麻烦)?(?:帮我)?(?:(?:同意|批准|确认)?(?:合入|合并)(?:(?:所有|全部)(?:待审批的?)?\s*(?:pr|pull requests?)|\s*(?:pr\s*)?#?\d+)|拒绝\s*(?:pr\s*)?#?\d+)(?:\s*(?:吧|一下))?[。！!？?]?$",
+    re.IGNORECASE,
+)
+
+
+def looks_like_datahub_approval_command(
+    value: Any,
+    *,
+    has_reply_context: bool,
+) -> bool:
+    """Claim only explicit approval language; ordinary chat still reaches Hermes."""
+
+    text = _normalized_command_text(value)
+    if not text or len(text) > 256:
+        return False
+    return bool(
+        _EXPLICIT_COMMAND_RE.fullmatch(text)
+        or (has_reply_context and _REPLY_COMMAND_RE.fullmatch(text))
+    )
 
 
 def _iso_utc(timestamp: float) -> str:
@@ -263,6 +305,12 @@ class DataHubVerifiedApprovalHandler:
                     action_id=str(receipt["actionId"]),
                     state=str(receipt["overallState"]),
                 ),
+                reply_text=(
+                    "✅ 审批已记录\n"
+                    f"Action: {receipt['actionId']}\n"
+                    f"当前状态: {receipt['overallState']}\n"
+                    "Hermes 正在继续合入、部署并验证业务恢复。"
+                ),
             )
         except ApprovalBoundaryError as exc:
             if exc.uncertain:
@@ -273,6 +321,10 @@ class DataHubVerifiedApprovalHandler:
                         template="orange",
                         message="结果暂不确定，请稍后重试或查询 Action 当前状态。",
                     ),
+                    reply_text=(
+                        "⏳ 审批结果暂不确定；原审批卡和 Action 状态均未被视觉结果替代。"
+                        "Hermes 将以 DataHub 的实际状态为准。"
+                    ),
                 )
             return ApprovalCallbackResult(
                 state="rejected",
@@ -281,6 +333,7 @@ class DataHubVerifiedApprovalHandler:
                     template="red",
                     message="回调校验失败或审批不可用；Action 保持原状态。",
                 ),
+                reply_text="❌ 审批未记录；回调校验失败或当前审批已不可用。",
             )
         except Exception:
             return ApprovalCallbackResult(
@@ -290,7 +343,178 @@ class DataHubVerifiedApprovalHandler:
                     template="orange",
                     message="结果暂不确定，请稍后重试或查询 Action 当前状态。",
                 ),
+                reply_text=(
+                    "⏳ 审批结果暂不确定；原审批卡和 Action 状态均未被视觉结果替代。"
+                    "Hermes 将以 DataHub 的实际状态为准。"
+                ),
             )
+
+    def handle_conversation(
+        self,
+        data: Any,
+        command_text: str,
+    ) -> ConversationApprovalResult:
+        """Submit one SDK-verified, explicitly parsed Feishu approval command."""
+
+        try:
+            request = self._build_conversation_request(data, command_text)
+            receipt = self._decide_conversation(request)
+            accepted = int(receipt.get("acceptedCount") or 0)
+            matched = int(receipt.get("matchedCount") or 0)
+            decision = str(receipt.get("decision") or "")
+            verb = "批准" if decision == "approve" else "拒绝"
+            if accepted < 1:
+                message = f"未{verb}任何 PR；匹配到 {matched} 个待审批项。"
+            else:
+                message = (
+                    f"✅ 已{verb} {accepted} 个修复 PR"
+                    + (f"（匹配 {matched} 个）" if matched != accepted else "")
+                    + "。Hermes 正在继续执行并验证业务恢复。"
+                )
+            return ConversationApprovalResult(state="committed", reply_text=message)
+        except ApprovalBoundaryError as exc:
+            if exc.uncertain:
+                return ConversationApprovalResult(
+                    state="uncertain",
+                    reply_text="⏳ 对话审批结果暂不确定，请稍后查询 Action 状态。",
+                )
+            return ConversationApprovalResult(
+                state="rejected",
+                reply_text="❌ 这条对话未形成审批：指令、身份、范围或当前状态校验失败。",
+            )
+        except Exception:
+            return ConversationApprovalResult(
+                state="uncertain",
+                reply_text="⏳ 对话审批结果暂不确定，请稍后查询 Action 状态。",
+            )
+
+    def _build_conversation_request(
+        self,
+        data: Any,
+        command_text: str,
+    ) -> Mapping[str, Any]:
+        if not self._enabled:
+            raise ApprovalBoundaryError("approval_disabled")
+        if self._connection_mode != "websocket":
+            raise ApprovalBoundaryError("invalid_transport")
+        if not all(
+            [self._app_id, self._tenant_key, self._base_url, self._gateway_token]
+        ):
+            raise ApprovalBoundaryError("approval_not_configured")
+        base_url = _validate_base_url(self._base_url)
+        normalized_text = re.sub(r"\s+", " ", command_text.strip())
+        if not normalized_text or len(normalized_text) > 256:
+            raise ApprovalBoundaryError("invalid_command")
+
+        header = _read(data, "header")
+        event = _read(data, "event")
+        sender = _read(_read(event, "sender"), "sender_id")
+        message = _read(event, "message")
+        event_id = _required_text(_read(header, "event_id"), "event_id")
+        event_type = _required_text(_read(header, "event_type"), "event_type")
+        if event_type != "im.message.receive_v1":
+            raise ApprovalBoundaryError("invalid_event_type")
+        tenant_key = _required_text(_read(header, "tenant_key"), "tenant_key")
+        if tenant_key != self._tenant_key:
+            raise ApprovalBoundaryError("tenant_mismatch")
+        principal_open_id = _required_text(
+            _read(sender, "open_id"), "principal_open_id"
+        )
+        chat_id = _required_text(_read(message, "chat_id"), "chat_id")
+        message_id = _required_text(_read(message, "message_id"), "message_id")
+        parent_message_id = str(_read(message, "parent_id") or "").strip() or None
+        root_message_id = str(_read(message, "root_id") or "").strip() or None
+        occurred_timestamp, occurred_at = _parse_occurred_at(
+            _read(header, "create_time")
+        )
+        received_timestamp = self._wall_clock()
+        age = received_timestamp - occurred_timestamp
+        if age < -30 or age > self._event_max_age_seconds:
+            raise ApprovalBoundaryError("event_outside_freshness_window")
+        received_at = _iso_utc(received_timestamp)
+        digest_material = {
+            "header": {
+                "event_id": event_id,
+                "event_type": event_type,
+                "tenant_key": tenant_key,
+                "create_time": occurred_at,
+            },
+            "event": {
+                "principal_open_id": principal_open_id,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "parent_message_id": parent_message_id,
+                "root_message_id": root_message_id,
+                "command_text": normalized_text,
+            },
+        }
+        raw_event_digest = hashlib.sha256(
+            json.dumps(
+                digest_material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "baseUrl": base_url,
+            "body": {
+                "schemaVersion": CONVERSATION_SCHEMA,
+                "event": {
+                    "schemaVersion": CONVERSATION_EVENT_SCHEMA,
+                    "source": "feishu",
+                    "transport": "websocket",
+                    "verified": True,
+                    "appId": self._app_id,
+                    "tenantKey": tenant_key,
+                    "eventId": event_id,
+                    "eventType": event_type,
+                    "principalOpenId": principal_open_id,
+                    "chatId": chat_id,
+                    "messageId": message_id,
+                    **(
+                        {"parentMessageId": parent_message_id}
+                        if parent_message_id
+                        else {}
+                    ),
+                    **(
+                        {"rootMessageId": root_message_id}
+                        if root_message_id
+                        else {}
+                    ),
+                    "occurredAt": occurred_at,
+                    "receivedAt": received_at,
+                    "rawEventDigest": raw_event_digest,
+                },
+                "commandText": normalized_text,
+            },
+        }
+
+    def _decide_conversation(
+        self,
+        request: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        body = request["body"]
+        if not isinstance(body, Mapping):
+            raise ApprovalBoundaryError("invalid_request")
+        url = f"{request['baseUrl']}/v1/conversation-decisions"
+        receipt = self._transport(
+            url,
+            self._gateway_token,
+            body,
+            self._callback_timeout_seconds,
+        )
+        if (
+            receipt.get("schemaVersion") != CONVERSATION_RECEIPT_SCHEMA
+            or receipt.get("decision") not in {"approve", "reject"}
+            or receipt.get("selector")
+            not in {"reply", "pull_request", "all_pending_pull_requests"}
+            or not isinstance(receipt.get("matchedCount"), int)
+            or not isinstance(receipt.get("acceptedCount"), int)
+            or not isinstance(receipt.get("results"), list)
+        ):
+            raise DecisionTransportError(None, uncertain=True)
+        return receipt
 
     def _build_request(
         self,
