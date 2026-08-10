@@ -125,6 +125,7 @@ class CanonicalIntentTest(unittest.TestCase):
             "失败原因": "explain_current_failure",
             "为什么没有自动处理": "explain_automation",
             "再试一次": "request_retry",
+            "请重新登录": "request_relogin",
             "我本地登录好了": "confirm_local_login",
             "CAPTCHA 已完成": "confirm_captcha_complete",
         }
@@ -201,7 +202,7 @@ class LoginRecoveryConversationHandlerTest(unittest.TestCase):
         self.assertEqual(result.state, "not_implemented")
         self.assertEqual(len(adapter.calls), 1)
         body = adapter.calls[0]
-        self.assertEqual(body["intent"], "request_retry")
+        self.assertEqual(body["intent"], "request_relogin")
         self.assertEqual(body["target"], {"type": "profile", "id": "k1bxfpa8"})
         self.assertEqual(body["controlRequirements"]["conversationBinding"], "target_exact")
         self.assertEqual(body["event"]["rootMessageId"], "om_message_7")
@@ -226,6 +227,27 @@ class LoginRecoveryConversationHandlerTest(unittest.TestCase):
         self.assertEqual(result.state, "reassessment_queued")
         self.assertIn("已安排重新评估", result.reply_text)
         self.assertNotIn("Login Job 已启动", result.reply_text)
+
+    def test_action_queued_is_reported_as_direct_device_login(self):
+        def action_receipt(body):
+            receipt = RecordingAdapter._receipt(body)
+            receipt["state"] = "action_queued"
+            receipt["intentReceipt"] = {
+                "intent": body["intent"],
+                "accepted": True,
+                "execution": "action_queued",
+                "code": "action_queued",
+                "message": "已发布 relogin_device（Action action-7）。",
+            }
+            return receipt
+
+        result = handler(RecordingAdapter(action_receipt)).handle_conversation(
+            message_event(), "请重新登录"
+        )
+
+        self.assertEqual(result.state, "action_queued")
+        self.assertIn("已发布 relogin_device", result.reply_text)
+        self.assertNotIn("需要人工步骤", result.reply_text)
 
     def test_local_login_and_captcha_are_evidence_not_direct_login(self):
         for command, expected in (
