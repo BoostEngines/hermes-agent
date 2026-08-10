@@ -3,7 +3,9 @@
 This is deliberately a narrow control-plane adapter.  It parses only a
 small, canonical vocabulary from SDK-verified Feishu messages and forwards
 that intent to DataHub's server-owned recovery conversation endpoint.  It
-never contains credentials, browser cookies, or a direct relogin operation.
+never contains credentials, browser cookies, or a direct browser operation;
+DataHub may publish its audited relogin_device Action for an explicit
+operator login request.
 
 The server remains authoritative for principal permission, explicit target
 resolution, fresh recovery state, idempotency, and the decision to enqueue
@@ -37,6 +39,7 @@ _INTENT_NAMES = frozenset(
         "explain_current_failure",
         "explain_automation",
         "request_retry",
+        "request_relogin",
         "confirm_local_login",
         "confirm_captcha_complete",
     }
@@ -44,6 +47,7 @@ _INTENT_NAMES = frozenset(
 _WRITE_INTENT_NAMES = frozenset(
     {
         "request_retry",
+        "request_relogin",
         "confirm_local_login",
         "confirm_captcha_complete",
     }
@@ -51,6 +55,7 @@ _WRITE_INTENT_NAMES = frozenset(
 _RECEIPT_STATES = frozenset(
     {
         "explained",
+        "action_queued",
         "reassessment_queued",
         "requires_reassessment",
         "not_implemented",
@@ -148,11 +153,15 @@ _CANONICAL_COMMANDS = {
     "为什么没有自动恢复": "explain_automation",
     "再试一次": "request_retry",
     "重试一次": "request_retry",
-    "再登录一次": "request_retry",
-    "重新登录一次": "request_retry",
-    "重新登录": "request_retry",
-    "请重新登录": "request_retry",
-    "登录": "request_retry",
+    "再登录一次": "request_relogin",
+    "重新登录一次": "request_relogin",
+    "直接重新登录": "request_relogin",
+    "请直接重新登录": "request_relogin",
+    "重新登录": "request_relogin",
+    "请重新登录": "request_relogin",
+    "直接登录": "request_relogin",
+    "请直接登录": "request_relogin",
+    "登录": "request_relogin",
     "我本地登录好了": "confirm_local_login",
     "本地登录好了": "confirm_local_login",
     "我已经本地登录好了": "confirm_local_login",
@@ -499,9 +508,10 @@ class DataHubLoginRecoveryConversationHandler:
         )
         parent_message_id = str(_read(message, "parent_id") or "").strip() or None
         root_message_id = str(_read(message, "root_id") or "").strip() or None
-        # A target-qualified command may be sent from a status topic (or as a
-        # root message).  The server resolves the explicit profile/device in
-        # that mode.  Unqualified commands still require an Incident root.
+        # A target-qualified command may be sent from any verified status topic
+        # (or as a root message).  The server resolves the explicit
+        # profile/device in that mode.  Unqualified commands still require an
+        # Incident root.
         if root_message_id is None and intent.target is None:
             raise LoginRecoveryConversationError("missing_topic_message")
         thread_id = root_message_id or message_id
@@ -644,7 +654,7 @@ class DataHubLoginRecoveryConversationHandler:
             intent_receipt.get("intent") != intent.name
             or not isinstance(intent_receipt.get("accepted"), bool)
             or intent_receipt.get("execution")
-            not in {"not_started", "reassessment_queued"}
+            not in {"not_started", "reassessment_queued", "action_queued"}
             or not isinstance(intent_receipt.get("code"), str)
         ):
             raise LoginRecoveryConversationTransportError(None, uncertain=True)
@@ -662,7 +672,12 @@ class DataHubLoginRecoveryConversationHandler:
         lines = [f"🤖 Hermes：{title}", detail]
         if intent.is_write:
             intent_message = _safe_view_text(intent_receipt.get("message"), "")
-            if intent_receipt.get("execution") == "reassessment_queued":
+            execution = intent_receipt.get("execution")
+            if execution == "action_queued":
+                lines.append(
+                    "执行状态：已发布 relogin_device，设备将按现有执行器开始登录。"
+                )
+            elif execution == "reassessment_queued":
                 lines.append(
                     "执行状态：已安排重新评估。DataHub 会先读取新鲜状态，"
                     "只有现有恢复规划器允许时才会创建恢复动作。"
