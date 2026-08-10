@@ -4,15 +4,22 @@ Subject: [PATCH] feishu: intercept verified DataHub approvals before model routi
 
 --- a/plugins/platforms/feishu/adapter.py
 +++ b/plugins/platforms/feishu/adapter.py
-@@ -145,0 +146,5 @@ from hermes_constants import get_hermes_home
+@@ -145,0 +146,9 @@ from hermes_constants import get_hermes_home
 +from plugins.platforms.feishu.datahub_verified_approval import (
 +    DataHubVerifiedApprovalHandler,
 +    looks_like_datahub_approval_command,
 +    owns_datahub_action_value,
 +)
-@@ -1504,0 +1510,3 @@ class FeishuAdapter(BasePlatformAdapter):
++from plugins.platforms.feishu.datahub_login_recovery_conversation import (
++    DataHubLoginRecoveryConversationHandler,
++    looks_like_datahub_login_recovery_command,
++)
+@@ -1504,0 +1510,6 @@ class FeishuAdapter(BasePlatformAdapter):
 +        self._datahub_verified_approval = (
 +            DataHubVerifiedApprovalHandler.from_environment()
++        )
++        self._datahub_login_recovery_conversation = (
++            DataHubLoginRecoveryConversationHandler.from_environment()
 +        )
 @@ -2677,0 +2686,3 @@ class FeishuAdapter(BasePlatformAdapter):
 +        if owns_datahub_action_value(action_value):
@@ -97,6 +104,35 @@ Subject: [PATCH] feishu: intercept verified DataHub approvals before model routi
 +                text=result.reply_text,
 +            )
 +
++    async def _handle_datahub_login_recovery_conversation(
++        self,
++        *,
++        data: Any,
++        message: Any,
++        text: str,
++    ) -> None:
++        """Forward one canonical, verified topic reply to DataHub.
++
++        The handler contains no browser, credentials, or relogin invocation.
++        DataHub authorizes the principal and resolves the exact root topic
++        before it decides whether a recovery operation is allowed.
++        """
++        result = await self._run_blocking(
++            self._datahub_login_recovery_conversation.handle_conversation,
++            data,
++            text,
++        )
++        chat_id = str(getattr(message, "chat_id", "") or "")
++        message_id = str(getattr(message, "message_id", "") or "")
++        root_id = str(getattr(message, "root_id", "") or "")
++        if chat_id and message_id:
++            await self._reply_datahub_approval_result(
++                chat_id=chat_id,
++                reply_to_message_id=message_id,
++                thread_id=root_id or message_id,
++                text=result.reply_text,
++            )
++
 @@ -3268,0 +3358,21 @@ class FeishuAdapter(BasePlatformAdapter):
 +        parent_message_id = (
 +            getattr(message, "parent_id", None)
@@ -113,6 +149,21 @@ Subject: [PATCH] feishu: intercept verified DataHub approvals before model routi
 +            )
 +        ):
 +            await self._handle_datahub_conversation_approval(
++                data=data,
++                message=message,
++                text=text,
++            )
++            return
++
++        if (
++            not is_bot
++            and inbound_type == MessageType.TEXT
++            and looks_like_datahub_login_recovery_command(
++                text,
++                has_reply_context=bool(parent_message_id),
++            )
++        ):
++            await self._handle_datahub_login_recovery_conversation(
 +                data=data,
 +                message=message,
 +                text=text,

@@ -148,6 +148,10 @@ from plugins.platforms.feishu.datahub_verified_approval import (
     looks_like_datahub_approval_command,
     owns_datahub_action_value,
 )
+from plugins.platforms.feishu.datahub_login_recovery_conversation import (
+    DataHubLoginRecoveryConversationHandler,
+    looks_like_datahub_login_recovery_command,
+)
 from utils import atomic_json_write, env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -1513,6 +1517,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._datahub_verified_approval = (
             DataHubVerifiedApprovalHandler.from_environment()
         )
+        self._datahub_login_recovery_conversation = (
+            DataHubLoginRecoveryConversationHandler.from_environment()
+        )
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
@@ -2787,6 +2794,30 @@ class FeishuAdapter(BasePlatformAdapter):
                 text=result.reply_text,
             )
 
+    async def _handle_datahub_login_recovery_conversation(
+        self,
+        *,
+        data: Any,
+        message: Any,
+        text: str,
+    ) -> None:
+        """Forward one canonical, verified login-recovery reply to DataHub."""
+        result = await self._run_blocking(
+            self._datahub_login_recovery_conversation.handle_conversation,
+            data,
+            text,
+        )
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        root_id = str(getattr(message, "root_id", "") or "")
+        if chat_id and message_id:
+            await self._reply_datahub_approval_result(
+                chat_id=chat_id,
+                reply_to_message_id=message_id,
+                thread_id=root_id or message_id,
+                text=result.reply_text,
+            )
+
     @staticmethod
     def _loop_accepts_callbacks(loop: Any) -> bool:
         """Return True when the adapter loop can accept thread-safe submissions."""
@@ -3402,6 +3433,21 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         ):
             await self._handle_datahub_conversation_approval(
+                data=data,
+                message=message,
+                text=text,
+            )
+            return
+
+        if (
+            not is_bot
+            and inbound_type == MessageType.TEXT
+            and looks_like_datahub_login_recovery_command(
+                text,
+                has_reply_context=bool(parent_message_id),
+            )
+        ):
+            await self._handle_datahub_login_recovery_conversation(
                 data=data,
                 message=message,
                 text=text,
