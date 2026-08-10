@@ -35,6 +35,9 @@ CONVERSATION_RECEIPT_SCHEMA = (
 DECISIONS = frozenset({"approve", "reject", "cancel"})
 _CHALLENGE_RE = re.compile(r"^v1\.[A-Za-z0-9_-]{32}\.[A-Za-z0-9_-]{32}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_PULL_REQUEST_TARGET_RE = re.compile(
+    r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)$"
+)
 _ACTION_FIELDS = frozenset(
     {"schemaVersion", "actionId", "challengeRevision", "decision", "challenge"}
 )
@@ -85,6 +88,16 @@ def _required_text(value: Any, name: str) -> str:
     if not normalized or len(normalized) > 512:
         raise ApprovalBoundaryError(f"missing_{name}")
     return normalized
+
+
+def _pull_request_url(receipt: Mapping[str, Any]) -> str | None:
+    target_id = str(receipt.get("targetId") or "").strip()
+    match = _PULL_REQUEST_TARGET_RE.fullmatch(target_id)
+    if match is None:
+        return None
+    expected = f"https://github.com/{match.group(1)}/pull/{match.group(2)}"
+    supplied = str(receipt.get("targetUrl") or "").strip()
+    return expected if not supplied or supplied == expected else None
 
 
 def _parse_action_value(value: Any) -> Mapping[str, Any] | None:
@@ -296,6 +309,15 @@ class DataHubVerifiedApprovalHandler:
         try:
             request = self._build_request(data, action_value)
             receipt = self._decide(request)
+            pull_request_url = _pull_request_url(receipt)
+            reply_lines = [
+                "✅ 审批已记录",
+                f"Action: {receipt['actionId']}",
+                f"当前状态: {receipt['overallState']}",
+            ]
+            if pull_request_url:
+                reply_lines.append(f"PR: {pull_request_url}")
+            reply_lines.append("Hermes 正在继续合入、部署并验证业务恢复。")
             return ApprovalCallbackResult(
                 state="committed",
                 card=_status_card(
@@ -305,12 +327,7 @@ class DataHubVerifiedApprovalHandler:
                     action_id=str(receipt["actionId"]),
                     state=str(receipt["overallState"]),
                 ),
-                reply_text=(
-                    "✅ 审批已记录\n"
-                    f"Action: {receipt['actionId']}\n"
-                    f"当前状态: {receipt['overallState']}\n"
-                    "Hermes 正在继续合入、部署并验证业务恢复。"
-                ),
+                reply_text="\n".join(reply_lines),
             )
         except ApprovalBoundaryError as exc:
             if exc.uncertain:
@@ -363,6 +380,14 @@ class DataHubVerifiedApprovalHandler:
             matched = int(receipt.get("matchedCount") or 0)
             decision = str(receipt.get("decision") or "")
             verb = "批准" if decision == "approve" else "拒绝"
+            pull_request_urls = list(
+                dict.fromkeys(
+                    url
+                    for result in receipt.get("results", [])
+                    if isinstance(result, Mapping)
+                    if (url := _pull_request_url(result)) is not None
+                )
+            )
             if accepted < 1:
                 message = f"未{verb}任何 PR；匹配到 {matched} 个待审批项。"
             else:
@@ -371,6 +396,8 @@ class DataHubVerifiedApprovalHandler:
                     + (f"（匹配 {matched} 个）" if matched != accepted else "")
                     + "。Hermes 正在继续执行并验证业务恢复。"
                 )
+                if pull_request_urls:
+                    message += "\nPR:\n" + "\n".join(pull_request_urls)
             return ConversationApprovalResult(state="committed", reply_text=message)
         except ApprovalBoundaryError as exc:
             if exc.uncertain:
@@ -694,6 +721,9 @@ class DataHubVerifiedApprovalHandler:
             or not str(receipt.get("targetVersion") or "").strip()
             or not str(receipt.get("decisionEventId") or "").strip()
         ):
+            raise DecisionTransportError(None, uncertain=True)
+        target_url = str(receipt.get("targetUrl") or "").strip()
+        if target_url and _pull_request_url(receipt) is None:
             raise DecisionTransportError(None, uncertain=True)
 
 

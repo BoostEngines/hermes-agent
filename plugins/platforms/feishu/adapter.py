@@ -148,6 +148,10 @@ from plugins.platforms.feishu.datahub_verified_approval import (
     looks_like_datahub_approval_command,
     owns_datahub_action_value,
 )
+from plugins.platforms.feishu.datahub_login_recovery_conversation import (
+    DataHubLoginRecoveryConversationHandler,
+    looks_like_datahub_login_recovery_command,
+)
 from utils import atomic_json_write, env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -182,6 +186,9 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_FEISHU_ROUTING_IDENTIFIER_RE = re.compile(
+    r"^(?:oc|om|omt)_[A-Za-z0-9_-]{1,180}$"
+)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -1510,6 +1517,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._datahub_verified_approval = (
             DataHubVerifiedApprovalHandler.from_environment()
         )
+        self._datahub_login_recovery_conversation = (
+            DataHubLoginRecoveryConversationHandler.from_environment()
+        )
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
@@ -2784,6 +2794,30 @@ class FeishuAdapter(BasePlatformAdapter):
                 text=result.reply_text,
             )
 
+    async def _handle_datahub_login_recovery_conversation(
+        self,
+        *,
+        data: Any,
+        message: Any,
+        text: str,
+    ) -> None:
+        """Forward one canonical, verified login-recovery reply to DataHub."""
+        result = await self._run_blocking(
+            self._datahub_login_recovery_conversation.handle_conversation,
+            data,
+            text,
+        )
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        root_id = str(getattr(message, "root_id", "") or "")
+        if chat_id and message_id:
+            await self._reply_datahub_approval_result(
+                chat_id=chat_id,
+                reply_to_message_id=message_id,
+                thread_id=root_id or message_id,
+                text=result.reply_text,
+            )
+
     @staticmethod
     def _loop_accepts_callbacks(loop: Any) -> bool:
         """Return True when the adapter loop can accept thread-safe submissions."""
@@ -3326,17 +3360,46 @@ class FeishuAdapter(BasePlatformAdapter):
     # Inbound processing pipeline
     # =========================================================================
 
-    def _resolve_channel_prompt(self, chat_id: str, parent_id: str | None = None) -> str | None:
+    def _resolve_channel_prompt(
+        self,
+        chat_id: str,
+        parent_id: str | None = None,
+        *,
+        root_message_id: str | None = None,
+    ) -> str | None:
         """Resolve a Feishu per-channel system prompt.
 
         Mirrors the Discord/Slack behaviour so ``channel_prompts: {<chat_id>:
         "<prompt>"}`` in ``PlatformConfig.extra`` is honoured for Feishu chats
-        instead of being silently ignored.
+        instead of being silently ignored. Topic routing identifiers come from
+        the signed Feishu event rather than user text and are exposed as an
+        ephemeral system prompt so a domain agent can perform an exact lookup.
         """
         from gateway.platforms.base import resolve_channel_prompt
         _config = getattr(self, "config", None)
         _extra = getattr(_config, "extra", None) or {}
-        return resolve_channel_prompt(_extra, chat_id, parent_id)
+        configured_prompt = resolve_channel_prompt(_extra, chat_id, parent_id)
+        trusted_identifiers = (chat_id, parent_id, root_message_id)
+        routing_prompt = None
+        if (
+            parent_id
+            and root_message_id
+            and all(
+                _FEISHU_ROUTING_IDENTIFIER_RE.fullmatch(value or "")
+                for value in trusted_identifiers
+            )
+        ):
+            routing_prompt = (
+                "Trusted Feishu routing metadata from the current signed event. "
+                "Use it only for deterministic topic/context lookup; never "
+                "substitute another topic's context.\n"
+                f"chat_id={chat_id}\n"
+                f"thread_id={parent_id}\n"
+                f"root_message_id={root_message_id}"
+            )
+        return "\n\n".join(
+            part for part in (configured_prompt, routing_prompt) if part
+        ) or None
 
     async def _process_inbound_message(
         self,
@@ -3376,6 +3439,21 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             return
 
+        if (
+            not is_bot
+            and inbound_type == MessageType.TEXT
+            and looks_like_datahub_login_recovery_command(
+                text,
+                has_reply_context=bool(parent_message_id),
+            )
+        ):
+            await self._handle_datahub_login_recovery_conversation(
+                data=data,
+                message=message,
+                text=text,
+            )
+            return
+
         # Guard runs post-strip so a pure "@Bot" message (stripped to "") is dropped.
         if inbound_type == MessageType.TEXT and not text and not media_urls:
             logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
@@ -3386,7 +3464,8 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        root_message_id = getattr(message, "root_id", None) or None
+        thread_id = getattr(message, "thread_id", None) or root_message_id or None
         reply_to_message_id = parent_message_id
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
 
@@ -3431,7 +3510,11 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
-            channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
+            channel_prompt=self._resolve_channel_prompt(
+                chat_id,
+                thread_id or None,
+                root_message_id=root_message_id,
+            ),
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)

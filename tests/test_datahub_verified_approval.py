@@ -106,6 +106,8 @@ def receipt(**overrides):
         "decisionEventId": "decision-event-7",
         "externalEventKey": "feishu:cli_app_7:event-7",
         "planHash": "c" * 64,
+        "targetId": "BoostEngines/bes-data-hub#428",
+        "targetUrl": "https://github.com/BoostEngines/bes-data-hub/pull/428",
         "targetVersion": "target-version-7",
     }
     value.update(overrides)
@@ -171,6 +173,10 @@ class VerifiedNormalizationTest(unittest.TestCase):
         result = handler(transport).handle(event(), action())
 
         self.assertEqual(result.state, "committed")
+        self.assertIn(
+            "https://github.com/BoostEngines/bes-data-hub/pull/428",
+            result.reply_text,
+        )
         self.assertEqual(
             calls[0][0],
             "https://datahub.example.invalid/api/ops/v1/actions/"
@@ -343,7 +349,11 @@ class ConversationApprovalTest(unittest.TestCase):
                 "selector": "all_pending_pull_requests",
                 "matchedCount": 3,
                 "acceptedCount": 3,
-                "results": [{"actionId": ACTION_ID}],
+                "results": [{
+                    "actionId": ACTION_ID,
+                    "targetId": "BoostEngines/bes-data-hub#428",
+                    "targetUrl": "https://github.com/BoostEngines/bes-data-hub/pull/428",
+                }],
             }
 
         result = handler(transport).handle_conversation(
@@ -352,6 +362,10 @@ class ConversationApprovalTest(unittest.TestCase):
 
         self.assertEqual(result.state, "committed")
         self.assertIn("3 个修复 PR", result.reply_text)
+        self.assertIn(
+            "https://github.com/BoostEngines/bes-data-hub/pull/428",
+            result.reply_text,
+        )
         self.assertEqual(
             calls[0][0],
             "https://datahub.example.invalid/api/ops/v1/conversation-decisions",
