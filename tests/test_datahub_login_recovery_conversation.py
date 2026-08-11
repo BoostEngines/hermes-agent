@@ -123,6 +123,8 @@ class CanonicalIntentTest(unittest.TestCase):
         expected = {
             "现在什么问题？": "explain_current_failure",
             "失败原因": "explain_current_failure",
+            "好了么": "explain_current_failure",
+            "登录成功了吗": "explain_current_failure",
             "为什么没有自动处理": "explain_automation",
             "再试一次": "request_retry",
             "请重新登录": "request_relogin",
