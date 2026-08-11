@@ -3464,8 +3464,22 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        root_message_id = getattr(message, "root_id", None) or None
-        thread_id = getattr(message, "thread_id", None) or root_message_id or None
+        raw_root_message_id = getattr(message, "root_id", None) or None
+        if chat_type == "p2p":
+            root_message_id = raw_root_message_id
+            thread_id = (
+                getattr(message, "thread_id", None)
+                or raw_root_message_id
+                or None
+            )
+        else:
+            # Feishu does not populate root_id/thread_id on a new group root
+            # message. Treat that message as its own topic immediately so a
+            # sender's unrelated roots cannot reuse one long-lived session.
+            # Replies always converge on the root message id, even when the
+            # event also carries a native omt_* thread id.
+            root_message_id = raw_root_message_id or parent_message_id or message_id
+            thread_id = root_message_id
         reply_to_message_id = parent_message_id
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
 

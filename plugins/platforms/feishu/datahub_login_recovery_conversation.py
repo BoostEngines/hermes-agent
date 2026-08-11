@@ -65,6 +65,7 @@ _ROUTING_IDENTIFIER_RE = re.compile(r"^(?:oc|om|omt)_[A-Za-z0-9_-]{1,180}$")
 _OPEN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 _ENDPOINT_PATH_RE = re.compile(r"^/v1/[A-Za-z0-9._/-]{1,240}$")
 _TARGET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
+_DEVICE_ORDINAL_PREFIX_RE = re.compile(r"^\d{1,4}号设备")
 
 
 class LoginRecoveryConversationError(Exception):
@@ -172,7 +173,7 @@ _CANONICAL_COMMANDS = {
 
 
 def _targeted_intent(text: str) -> CanonicalIntent | None:
-    """Parse ``<profile> <fixed command>`` without forwarding raw text."""
+    """Parse ``[<ordinal>号设备] <profile> <fixed command>`` safely."""
 
     separators = ":：,，"
     for command, name in sorted(
@@ -187,6 +188,7 @@ def _targeted_intent(text: str) -> CanonicalIntent | None:
             if candidate == text or not candidate:
                 continue
             candidate = candidate.strip(separators)
+            candidate = _DEVICE_ORDINAL_PREFIX_RE.sub("", candidate, count=1)
             if _TARGET_ID_RE.fullmatch(candidate):
                 return CanonicalIntent(
                     name,

@@ -146,6 +146,27 @@ class CanonicalIntentTest(unittest.TestCase):
             )
         )
 
+    def test_parses_device_ordinal_and_profile_without_forwarding_free_text(self):
+        intent = MODULE.canonical_login_recovery_intent(
+            "95 号设备 k1c89u03 请重新登录"
+        )
+
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.name, "request_relogin")
+        self.assertEqual(intent.target.type, "profile")
+        self.assertEqual(intent.target.id, "k1c89u03")
+        self.assertTrue(
+            MODULE.looks_like_datahub_login_recovery_command(
+                "95 号设备 k1c89u03 请重新登录",
+                has_reply_context=False,
+            )
+        )
+        self.assertIsNone(
+            MODULE.canonical_login_recovery_intent(
+                "95 号设备 k1c89u03 请重新登录，密码是 x"
+            )
+        )
+
 
 class LoginRecoveryConversationHandlerTest(unittest.TestCase):
     def test_accepts_the_actual_server_receipt_shape_without_top_level_intent(self):
