@@ -190,6 +190,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Idempotency: TTL cache of recently processed delivery IDs.
         # Prevents duplicate agent runs when webhook providers retry.
         self._seen_deliveries: Dict[str, float] = {}
+        self._admission_receipts: Dict[str, asyncio.Future] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
 
@@ -395,6 +396,7 @@ class WebhookAdapter(BasePlatformAdapter):
         stale = [k for k, t in self._seen_deliveries.items() if t < cutoff]
         for k in stale:
             self._seen_deliveries.pop(k, None)
+            self._admission_receipts.pop(k, None)
         self._seen_deliveries_next_prune_at = now + min(60.0, max(1.0, self._idempotency_ttl / 10))
 
     def _record_rate_limit_hit(self, route_name: str, now: float) -> bool:
@@ -419,6 +421,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
         if seen_at is not None:
             self._seen_deliveries.pop(delivery_id, None)
+            self._admission_receipts.pop(delivery_id, None)
         self._seen_deliveries[delivery_id] = now
         if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
             self._prune_seen_deliveries(now)
@@ -732,6 +735,11 @@ class WebhookAdapter(BasePlatformAdapter):
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
         if not self._record_delivery_id(delivery_id, now):
+            previous_admission = self._admission_receipts.get(delivery_id)
+            if previous_admission is not None and not previous_admission.done():
+                return web.json_response(
+                    {"status": "admission_pending", "delivery_id": delivery_id}, status=202,
+                )
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -843,7 +851,23 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
-        # Non-blocking — return 202 Accepted immediately.  The per-delivery
+        # Wait only for session admission, never for the model turn. A 202
+        # before admission silently loses deliveries when the runner is full.
+        admission = None
+        if getattr(self.gateway_runner, "supports_webhook_admission", False) is True:
+            admission = asyncio.get_running_loop().create_future()
+            self._admission_receipts[delivery_id] = admission
+
+            def record_admission(accepted: bool) -> None:
+                if not admission.done():
+                    admission.set_result(accepted)
+                    if not accepted and self._admission_receipts.get(delivery_id) is admission:
+                        self._seen_deliveries.pop(delivery_id, None)
+                        self._admission_receipts.pop(delivery_id, None)
+
+            event.admission_callback = record_admission
+
+        # The per-delivery
         # session is closed by the ``on_processing_complete`` override below
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
@@ -852,9 +876,25 @@ class WebhookAdapter(BasePlatformAdapter):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+        receipt_status = "accepted"
+        if admission is not None:
+            try:
+                accepted = await asyncio.wait_for(asyncio.shield(admission), timeout=2.0)
+            except asyncio.TimeoutError:
+                # Outcome is unknown. Retain idempotency and do not cancel a
+                # run that may already be starting; callers must retain leases.
+                receipt_status = "admission_pending"
+            else:
+                if not accepted:
+                    return web.json_response(
+                        {"status": "rejected", "error": "agent_not_admitted", "delivery_id": delivery_id},
+                        status=429,
+                        headers={"Retry-After": "30"},
+                    )
+
         return web.json_response(
             {
-                "status": "accepted",
+                "status": receipt_status,
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
@@ -884,7 +924,13 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        try:
+            await self._end_webhook_session(event, event.source.chat_id)
+        finally:
+            # Early returns (capacity, drain, authorization) never admitted a
+            # model turn. Successful admission is first-result-wins.
+            if event.admission_callback is not None:
+                event.admission_callback(False)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
