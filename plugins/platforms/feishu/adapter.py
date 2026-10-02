@@ -143,6 +143,7 @@ from gateway.platforms.base import (
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
+from plugins.platforms.feishu import datahub_subscriptions
 from plugins.platforms.feishu.datahub_verified_approval import (
     DataHubVerifiedApprovalHandler,
     looks_like_datahub_approval_command,
@@ -2693,6 +2694,14 @@ class FeishuAdapter(BasePlatformAdapter):
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
+        if (str(getattr(action, "name", "") or "").startswith("datahub_subscription_")
+                or isinstance(action_value, dict) and action_value.get("datahub_subscription") == "open"):
+            # SDK-verified callback; this namespace never falls through to a model.
+            result = datahub_subscriptions.handle_card(data)
+            if P2CardActionTriggerResponse is None:
+                return None
+            return P2CardActionTriggerResponse({"toast": {"type": "info", "content": result}})
+
         if owns_datahub_action_value(action_value):
             return self._handle_datahub_verified_approval(data, action_value)
 
@@ -3417,6 +3426,13 @@ class FeishuAdapter(BasePlatformAdapter):
             text = _strip_edge_self_mentions(text, mentions)
             if text.startswith("/"):
                 inbound_type = MessageType.COMMAND
+
+        if (
+            not is_bot
+            and inbound_type in {MessageType.TEXT, MessageType.COMMAND}
+            and await datahub_subscriptions.handle_message(self, data, text)
+        ):
+            return
 
         parent_message_id = (
             getattr(message, "parent_id", None)
