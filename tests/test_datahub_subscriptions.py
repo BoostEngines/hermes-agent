@@ -48,6 +48,8 @@ class SubscriptionTest(unittest.TestCase):
 
     def test_only_explicit_commands(self):
         self.assertTrue(s.owns_text(TEXT))
+        self.assertTrue(s.owns_text("请帮我给STEPLAB开通一年max"))
+        self.assertTrue(s.owns_text("给以下店铺完成1年max激活"))
         self.assertTrue(s.owns_text("请给这些店铺完成一年 max 激活"))
         for text in ["账户订阅激活已完成", "不要开通 MAX", "如何开通订阅？", "示例：开通 MAX", "Shop Code: USLC32EMHS\n邮箱: a@example.com"]:
             self.assertFalse(s.owns_text(text), text)

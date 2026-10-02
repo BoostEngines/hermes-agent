@@ -46,9 +46,9 @@ def owns_text(text):
     if re.search(r"[?？]|(?:不要|不需要|无需|不开通|不激活|暂不|取消|是否|能否|可以吗|如何|怎么|已完成|已激活|已开通|未激活|未开通|例如|示例|假设)", value):
         return False
     return any(
-        re.match(r"^(?:(?:请|麻烦|帮我|帮忙|辛苦|给|为)\s*)?(?:激活|开通|监测|给|为)", line)
+        re.match(r"^(?:(?:请|麻烦|帮我|帮忙|辛苦)\s*)*(?:激活|开通|监测|给|为)", line)
         and re.search(r"激活|开通|监测", line)
-        and re.search(r"autoboost|\bab\b|\bmax\b|订阅", line, re.I)
+        and re.search(r"autoboost|(?<![a-z0-9])(?:ab|max)(?![a-z0-9])|订阅", line, re.I)
         for line in value.splitlines()
     )
 

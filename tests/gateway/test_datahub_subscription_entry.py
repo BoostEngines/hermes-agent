@@ -38,4 +38,13 @@ def test_real_adapter_admits_text_and_card_without_model(tmp_path, monkeypatch):
     assert response.toast.content == "已接收，将在本群反馈处理结果。"
     with store.connect() as db:
         assert db.execute("SELECT count(*) FROM forms").fetchone()[0] == 1
+    s.Worker(store, deliver=lambda *_: "om_form").flush()
+    nonce = s.digest("sdk-card")
+    form = P2CardActionTrigger({"header": {**header, "event_type": "card.action.trigger", "event_id": "sdk-form"}, "event": {"operator": {"open_id": "ou_developer"}, "context": {"open_chat_id": s.CHAT_ID, "open_message_id": "om_form"}, "action": {"tag": "button", "name": "datahub_subscription_" + nonce, "form_value": {"years": "1", "accounts": "USLC32EMHS maria.garcia7104@zohomail.com"}}}})
+    async def submit():
+        adapter._loop = asyncio.get_running_loop()
+        return adapter._on_card_action_trigger(form)
+    assert asyncio.run(submit()).toast.content == "已接收，将在本群反馈处理结果。"
+    with store.connect() as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
     adapter._dispatch_inbound_event.assert_not_called()
