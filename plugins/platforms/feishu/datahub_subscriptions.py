@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -28,6 +29,14 @@ EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2
 SHOP = re.compile(r"\b(?:[A-Z]{2}[A-Z0-9]{6,30}|\d{10,24})\b")
 YEARS = re.compile(r"([123一二两三])\s*(?:年|years?\b)", re.I)
 MENU = {"订阅激活菜单", "开通订阅菜单", "autoboost订阅菜单", "/ab"}
+FIELDS = re.compile(r"(?<![\w@])(?:shop\s*(?:name|code|id)|店铺名称|店铺名|店铺编号|店铺代码|邮箱|email)\s*:", re.I)
+GRACE_SECONDS = 60
+NEEDS_INPUT = {
+    "shop_code_required_no_match": "未找到关联店铺，请补充 Shop Code。",
+    "shop_code_required_multiple_matches": "关联多家店铺，请补充 Shop Code。",
+    "owner_not_found": "未找到此 AutoBoost 邮箱，请核对邮箱。",
+    "subscription_changed_after_preview": "预览后订阅状态发生变化，请核对后重新提交。",
+}
 
 
 def read(obj, key, default=None):
@@ -49,12 +58,12 @@ def owns_text(text):
         re.match(r"^(?:(?:请|麻烦|帮我|帮忙|辛苦)\s*)*(?:激活|开通|监测|给|为)", line)
         and re.search(r"激活|开通|监测", line)
         and re.search(r"autoboost|(?<![a-z0-9])(?:ab|max)(?![a-z0-9])|订阅", line, re.I)
-        for line in value.splitlines()
+        for line in map(str.strip, value.splitlines())
     )
 
 
 def parse_targets(text, years=None):
-    """Labelled blocks, TSV/CSV rows, or one email + shop per line; no guessing."""
+    """Normalize pasted fields; resolve optional shop references in the backend."""
     text = unicodedata.normalize("NFKC", text)
     if len(text) > 16000 or "```" in text or any(x.lstrip().startswith(">") for x in text.splitlines()):
         raise ValueError("请直接发送店铺信息，不要使用引用或代码块。")
@@ -77,13 +86,14 @@ def parse_targets(text, years=None):
         nonlocal current
         if not current:
             return
-        if not current.get("email") or not (current.get("shopId") or current.get("shopCode")):
-            raise ValueError("每家店铺需要邮箱及 Shop Code 或 Shop ID，不能只提供店名。")
+        if not current.get("email"):
+            raise ValueError("请提供店铺对应的 AutoBoost 邮箱。Shop Code 可选。")
         current["years"] = duration
         targets.append(current)
         current = {}
 
-    for line in text.splitlines():
+    # Labels delimit fields even when a pasted message puts them on one line.
+    for line in FIELDS.sub(lambda match: "\n" + match.group(), text).splitlines():
         line = line.strip(" \t|,-;；")
         if not line or line == "---":
             continue
@@ -91,27 +101,48 @@ def parse_targets(text, years=None):
             if current.get("email"):
                 finish()
             continue
-        emails = EMAIL.findall(line)
+        shop_field = re.match(r"(shop\s*(?:code|id)|店铺编号|店铺代码)\s*:\s*(.*)$", line, re.I)
+        if shop_field:
+            line = shop_field[2]
+        email_field = re.match(r"(?:邮箱|email)\s*:\s*(.*)$", line, re.I)
+        if email_field and email_field[1].count("@") == 1:
+            compact = re.sub(r"\s+", "", email_field[1])
+            if EMAIL.fullmatch(compact):
+                line = compact
+        emails = list(dict.fromkeys(x.lower() for x in EMAIL.findall(line)))
         # Remove addresses first: numeric mailbox names must not become shop IDs.
-        refs = SHOP.findall(EMAIL.sub("", line))
-        if len(emails) > 1 or len(refs) > 1:
-            raise ValueError("每行最多一组邮箱和店铺编号；多店请分行或分块。")
-        if emails and current.get("email") or refs and (current.get("shopId") or current.get("shopCode")):
+        ref_text = EMAIL.sub("", line)
+        refs = list(dict.fromkeys(SHOP.findall(ref_text.upper() if shop_field else ref_text)))
+        if shop_field and not refs:
+            raise ValueError("提供的店铺编号不完整，请核对 Shop Code / Shop ID，或只提供邮箱。")
+        fields = {"shopId" if ref.isdigit() else "shopCode": ref for ref in refs}
+        if len(emails) > 1 or len(fields) != len(refs):
+            raise ValueError("这些信息对应多个邮箱或店铺，无法确定配对。请把每家店铺的信息放在一起，或只发送邮箱列表。")
+        if (emails and current.get("email") not in (None, emails[0])) or any(current.get(key) not in (None, value) for key, value in fields.items()):
             finish()
         if emails:
             current["email"] = emails[0].lower()
-        if refs:
-            current["shopId" if refs[0].isdigit() else "shopCode"] = refs[0]
+        current.update(fields)
     finish()
     if not targets or len(targets) > 50:
-        raise ValueError("每批支持 1–50 家店铺；请填写邮箱和 Shop Code 或 Shop ID。")
+        raise ValueError("每批支持 1–50 家店铺；请提供邮箱，Shop Code 可选。")
     unique = {}
     for target in targets:
-        key = target.get("shopId") or target["shopCode"]
+        key = target.get("shopId") or target.get("shopCode") or target["email"]
         if key in unique and unique[key] != target:
             raise ValueError("同一店铺出现不同邮箱，请核对后重新提交。")
         unique[key] = target
     return list(unique.values())
+
+
+def parse_message(text):
+    if not owns_text(text) or text.lower().strip() in MENU:
+        raise ValueError("请明确说明“开通 AutoBoost Max 订阅”或“监测订阅”。")
+    return {"action": "watch" if "监测" in text else "activate", "targets": parse_targets(text)}
+
+
+def is_cancel(text):
+    return bool(re.fullmatch(r"(?:请\s*)?取消\s*(?:激活|开通|ab\s*订阅|订阅激活)[。.!！]?", unicodedata.normalize("NFKC", text).strip(), re.I))
 
 
 def card(text):
@@ -120,18 +151,18 @@ def card(text):
 
 def entry_card():
     return {"schema": "2.0", "header": {"title": {"tag": "plain_text", "content": "AutoBoost 订阅激活入口"}}, "body": {"elements": [
-        {"tag": "markdown", "content": "点击填写年份、邮箱和店铺编号，支持多店批量开通 Max；默认 1 年。每次开通前都会核验当前订阅。"},
+        {"tag": "markdown", "content": "填写邮箱即可查询对应店铺，支持多店批量开通 Max；默认 1 年。每次开通前都会核验当前订阅并发送店铺清单供核对。"},
         {"tag": "button", "type": "primary_filled", "text": {"tag": "plain_text", "content": "填写激活表单"}, "behaviors": [{"type": "callback", "value": {"datahub_subscription": "open"}}]},
     ]}}
 
 
 def form_card(nonce):
     return {"schema": "2.0", "header": {"title": {"tag": "plain_text", "content": "AutoBoost Max 订阅激活"}}, "body": {"elements": [
-        {"tag": "markdown", "content": "仅在本群生效。默认 1 年，支持 1–3 年；已有效的订阅不会重复开通或延长。可填写单店，也可粘贴多行邮箱和 Shop Code / Shop ID。"},
+        {"tag": "markdown", "content": "仅在本群生效。默认 1 年，支持 1–3 年；已有效的订阅不会重复开通或延长。可填写单店或多行邮箱，店铺编号可选。查询清单发送后留 60 秒核对，期间回复可取消。"},
         {"tag": "form", "name": "subscription", "elements": [
             {"tag": "input", "name": "years", "label": {"tag": "plain_text", "content": "开通年份"}, "default_value": "1", "required": True},
             {"tag": "input", "name": "email", "label": {"tag": "plain_text", "content": "单店邮箱"}},
-            {"tag": "input", "name": "shop", "label": {"tag": "plain_text", "content": "单店 Shop Code / Shop ID"}},
+            {"tag": "input", "name": "shop", "label": {"tag": "plain_text", "content": "单店 Shop Code / Shop ID（可选）"}},
             {"tag": "input", "name": "accounts", "input_type": "multiline_text", "label": {"tag": "plain_text", "content": "批量店铺（与单店字段二选一）"}, "placeholder": {"tag": "plain_text", "content": "USLC32EMHS maria.garcia7104@zohomail.com\n另一店铺编号 另一邮箱"}},
             {"tag": "button", "name": "datahub_subscription_" + nonce, "type": "primary_filled", "width": "fill", "text": {"tag": "plain_text", "content": "开通 Max 订阅"}, "form_action_type": "submit"},
         ]},
@@ -173,8 +204,23 @@ class Store:
             if db.execute("INSERT OR IGNORE INTO batches VALUES (?, ?, ?, ?)", (batch, actor, self.now(), source)).rowcount == 0:
                 return False
             for i, target in enumerate(targets):
-                db.execute("INSERT INTO jobs (id, batch, target, status) VALUES (?, ?, ?, ?)", (digest(f"{batch}:{i}"), batch, json.dumps(target, sort_keys=True), "watch" if source == "watch" else "pending"))
+                db.execute("INSERT INTO jobs (id, batch, target, status) VALUES (?, ?, ?, ?)", (digest(f"{batch}:{i}"), batch, json.dumps(target, sort_keys=True), "watch" if source == "watch" else "resolving"))
         return True
+
+    def reply_batch(self, message):
+        refs = [read(message, "parent_id") or read(message, "upper_message_id", ""), read(message, "root_id", "")]
+        with self.connect() as db:
+            row = db.execute("SELECT b.id FROM batches b LEFT JOIN outbox o ON o.id='preview:' || b.id WHERE (b.id IN (?,?) OR o.message_id IN (?,?)) AND EXISTS (SELECT 1 FROM jobs WHERE batch=b.id AND status IN ('resolving','ready','pending') AND intent=0)", (*refs, *refs)).fetchone()
+        return row[0] if row else None
+
+    def cancel(self, request_id, actor, batch=None):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM outbox WHERE id=?", ("cancel:" + request_id,)).fetchone():
+                return
+            count = db.execute("UPDATE jobs SET status='cancelled' WHERE status IN ('resolving','ready','pending') AND intent=0 AND batch IN (SELECT id FROM batches WHERE id=? OR (? IS NULL AND actor=?))", (batch, batch, actor)).rowcount
+            text = f"已取消 {count} 项尚未执行的激活任务。" if count else "没有可取消的待执行任务；已经开始或完成的开通不会被撤销。"
+            db.execute("INSERT OR IGNORE INTO outbox (id,payload) VALUES (?,?)", ("cancel:" + request_id, json.dumps(card(text), ensure_ascii=False)))
 
     def notify(self, key, payload):
         with self.connect() as db:
@@ -226,14 +272,15 @@ class Gateway:
             enabled_at = float(db.execute("SELECT value FROM meta WHERE key='enabled_at'").fetchone()[0])
         if created < enabled_at or self.now() - created > 300 or created > self.now() + 30:
             raise ValueError("历史消息不能触发激活，请重新发送。")
+        reply_batch = self.store.reply_batch(message)
+        if is_cancel(text) or reply_batch:
+            self.store.cancel(batch, actor, reply_batch)
+            return
         if text.lower().strip() in MENU:
             self.open_form(batch)
             return
-        if not owns_text(text):
-            raise ValueError("请明确说明“开通 AutoBoost Max 订阅”或“监测订阅”。")
-        targets = parse_targets(text)
-        watch = "监测" in text
-        self.store.enqueue(batch, actor, targets, "watch" if watch else "activate")
+        parsed = parse_message(text)
+        self.store.enqueue(batch, actor, parsed["targets"], parsed["action"])
 
     def open_form(self, request_id):
         nonce = digest(request_id)
@@ -301,7 +348,7 @@ def shop_line(target, result):
     identity = result.get("identity", target)
     name = identity.get("shopName") or identity.get("shopCode") or identity.get("shopId") or "店铺"
     email = identity.get("email", target["email"])
-    expiry = result.get("subscription", {}).get("currentPeriodEnd", "")
+    expiry = (result.get("subscription") or {}).get("currentPeriodEnd", "")
     if expiry:
         expiry = datetime.fromisoformat(expiry.replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
     return f"- {html.escape(name)}｜{html.escape(email)}" + (f"｜有效期至 {expiry}" if expiry else "")
@@ -339,44 +386,81 @@ class Worker:
                 db.execute("UPDATE outbox SET message_id=? WHERE id=?", (message_id, row["id"]))
                 if row["id"].startswith("form:"):
                     db.execute("UPDATE forms SET message_id=? WHERE nonce=?", (message_id, row["id"][5:]))
+                if row["id"].startswith("preview:"):
+                    # Start the full grace period only after a confirmed delivery.
+                    db.execute("UPDATE jobs SET status='pending',next_at=? WHERE batch=? AND status='ready'", (self.store.now() + GRACE_SECONDS, row["id"][8:]))
+
+    def preview(self, batch):
+        with self.store.connect() as db:
+            rows = db.execute("SELECT * FROM jobs WHERE batch=? ORDER BY rowid", (batch,)).fetchall()
+        if any(row["status"] == "resolving" for row in rows) or not any(row["status"] == "ready" for row in rows):
+            return
+        lines = ["已找到以下对应店铺："]
+        for row in rows:
+            target, result = json.loads(row["target"]), json.loads(row["result"] or "{}")
+            if row["status"] == "ready":
+                identity = result["identity"]
+                label = "原订阅已有效，将跳过" if result.get("subscriptionReady") else f"将开通 {target['years']} 年 Max"
+                lines.append(shop_line(target, result) + f"｜{html.escape(identity.get('shopCode') or identity['shopId'])}｜{label}")
+            elif row["status"] in {"needs_input", "failed"}:
+                lines.append(shop_line(target, {}) + "｜" + NEEDS_INPUT.get(result.get("error"), "查询失败，本次不自动开通"))
+        lines.append(f"本消息发送成功 {GRACE_SECONDS} 秒后，将顺序处理匹配成功的店铺。回复本条消息可停止本批待执行任务；直接发送“取消激活”可取消你提交的待执行任务。修改后请重新提交。")
+        self.store.notify("preview:" + batch, card("\n".join(lines)))
 
     def tick(self, *, include_watch=True):
         self.flush()
         now = self.store.now()
         with self.store.connect() as db:
-            jobs = db.execute("SELECT j.*, b.actor FROM jobs j JOIN batches b ON b.id=j.batch WHERE j.status='pending' AND j.next_at<=? ORDER BY b.created,j.rowid LIMIT 1", (now,)).fetchall()
+            jobs = db.execute("SELECT j.*, b.actor FROM jobs j JOIN batches b ON b.id=j.batch WHERE j.status IN ('resolving','pending') AND j.next_at<=? ORDER BY b.created,j.rowid LIMIT 1", (now,)).fetchall()
         for job in jobs:
             target = json.loads(job["target"])
             request = {"target": target, "operationId": "hermes-sub:" + job["id"], "actor": job["actor"]}
             try:
                 result = self.call({**request, "mode": "inspect"})
+                identity = result["identity"]
+                if job["status"] == "resolving":
+                    # Pin the identity shown in the preview across retries and changed bindings.
+                    target.update({key: identity[key] for key in ("shopId", "shopCode", "uid") if identity.get(key)})
+                    with self.store.connect() as db:
+                        db.execute("UPDATE jobs SET status='ready',target=?,result=?,attempts=0 WHERE id=? AND status='resolving'", (json.dumps(target, sort_keys=True), json.dumps(result), job["id"]))
+                    continue
+                if any(target.get(key) and target[key] != identity.get(key) for key in ("shopId", "shopCode", "uid")):
+                    raise ValueError("shop_identity_mismatch")
+                if json.loads(job["result"] or "{}").get("subscriptionReady") and not result.get("subscriptionReady"):
+                    raise ValueError("subscription_changed_after_preview")
                 if not result.get("subscriptionReady"):
                     # Commit the intent BEFORE the API call. Recovered attempts reconcile the
                     # same operation and never issue another non-idempotent manual grant.
                     with self.store.connect() as db:
-                        identity = result["identity"]
+                        db.execute("BEGIN IMMEDIATE")
+                        # Cancellation and claiming the write are atomic with respect to each other.
+                        if not db.execute("UPDATE jobs SET intent=1 WHERE id=? AND status='pending'", (job["id"],)).rowcount:
+                            continue
                         key = identity["shopId"] + ":" + identity["uid"]
                         created = db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?, ?, ?)", (key, request["operationId"], target["years"], job["actor"])).rowcount == 1
                         grant = db.execute("SELECT * FROM grants WHERE shop=?", (key,)).fetchone()
                         if grant["years"] != target["years"]:
                             raise ValueError("existing_grant_duration_conflict")
                         request["operationId"], request["actor"] = grant["operation"], grant["actor"]
-                        db.execute("UPDATE jobs SET intent=1 WHERE id=?", (job["id"],))
                     result = self.call({**request, "mode": "activate", "allowCreate": created})
                 if not result.get("subscriptionReady"):
                     raise RuntimeError("subscription_not_verified")
                 with self.store.connect() as db:
-                    db.execute("UPDATE jobs SET status='success',result=?,fingerprint=?,checked_at=? WHERE id=?", (json.dumps(result), fingerprint(result), now, job["id"]))
+                    db.execute("UPDATE jobs SET status='success',result=?,fingerprint=?,checked_at=? WHERE id=? AND status='pending'", (json.dumps(result), fingerprint(result), now, job["id"]))
                     # A later watch of another request for this shop must not echo our own success.
                     db.execute("INSERT OR IGNORE INTO outbox (id,payload,message_id) VALUES (?, '{}', 'covered-by-batch')", ("observed:" + result["identity"]["shopId"] + ":" + fingerprint(result),))
             except Exception as exc:
                 attempts = job["attempts"] + 1
                 code = str(exc) if re.fullmatch(r"[a-z0-9_]{1,100}", str(exc)) else "subscription_backend_unavailable"
+                status = "needs_input" if code in NEEDS_INPUT else "failed" if attempts >= 3 else job["status"]
                 with self.store.connect() as db:
-                    db.execute("UPDATE jobs SET attempts=?,next_at=?,status=?,result=? WHERE id=?", (attempts, now + (10 if attempts == 1 else 30), "failed" if attempts >= 3 else "pending", json.dumps({"error": code}), job["id"]))
+                    db.execute("UPDATE jobs SET attempts=?,next_at=?,status=?,result=? WHERE id=? AND status=?", (attempts, now + (10 if attempts == 1 else 30), status, json.dumps({"error": code}), job["id"], job["status"]))
         # Recover a crash after saving terminal jobs but before composing their receipt.
         with self.store.connect() as db:
-            batches = db.execute("SELECT id FROM batches WHERE source='activate' AND NOT EXISTS (SELECT 1 FROM jobs WHERE batch=batches.id AND status='pending') AND NOT EXISTS (SELECT 1 FROM outbox WHERE id='complete:' || batches.id)").fetchall()
+            previews = db.execute("SELECT DISTINCT batch FROM jobs WHERE status='ready'").fetchall()
+            batches = db.execute("SELECT id FROM batches WHERE source='activate' AND NOT EXISTS (SELECT 1 FROM jobs WHERE batch=batches.id AND status IN ('resolving','ready','pending')) AND NOT EXISTS (SELECT 1 FROM outbox WHERE id='complete:' || batches.id)").fetchall()
+        for batch in previews:
+            self.preview(batch["batch"])
         for batch in batches:
             self.summarize(batch["id"])
         if include_watch:
@@ -386,7 +470,7 @@ class Worker:
     def summarize(self, batch):
         with self.store.connect() as db:
             rows = db.execute("SELECT * FROM jobs WHERE batch=? ORDER BY rowid", (batch,)).fetchall()
-        if any(row["status"] == "pending" for row in rows):
+        if any(row["status"] in {"resolving", "ready", "pending"} for row in rows):
             return
         successes = [row for row in rows if row["status"] == "success"]
         failures = [row for row in rows if row["status"] == "failed"]
@@ -401,12 +485,17 @@ class Worker:
             lines.append("⚠️ 以下店铺激活未完成，自动重试已结束；后续仍会监测订阅状态：")
             lines.extend(shop_line(json.loads(row["target"]), {}) + "｜" + json.loads(row["result"] or '{}').get("error", "需要核对") for row in failures)
             lines.append(f'<at email="{FLYNN_EMAIL}"></at> 请协助核对。')
+        for row in rows:
+            if row["status"] == "needs_input":
+                lines.append(shop_line(json.loads(row["target"]), {}) + "｜" + NEEDS_INPUT[json.loads(row["result"])["error"]])
+        if any(row["status"] == "cancelled" for row in rows):
+            lines.append("本批取消的任务未执行开通。")
         self.store.notify(f"complete:{batch}", card("\n".join(lines)))
 
     def watch(self):
         now = self.store.now()
         with self.store.connect() as db:
-            rows = db.execute("SELECT j.*,b.actor FROM jobs j JOIN batches b ON b.id=j.batch WHERE j.rowid IN (SELECT max(rowid) FROM jobs WHERE status!='pending' GROUP BY target) AND j.checked_at<=? ORDER BY j.checked_at LIMIT 50", (now - 30,)).fetchall()
+            rows = db.execute("SELECT j.*,b.actor FROM jobs j JOIN batches b ON b.id=j.batch WHERE j.rowid IN (SELECT max(rowid) FROM jobs WHERE status IN ('success','failed','watch') GROUP BY target) AND j.checked_at<=? ORDER BY j.checked_at LIMIT 50", (now - 30,)).fetchall()
         def inspect(row):
             target = json.loads(row["target"])
             try:
@@ -444,14 +533,14 @@ def gateway():
 
 async def handle_message(adapter, data, text):
     """Called only by the authenticated SDK inbound path, before model routing."""
-    if not owns_text(text):
-        return False
     if os.getenv("HERMES_SUBSCRIPTIONS_ENABLED") != "true":
         return False
     event = read(data, "event")
     message = read(event, "message")
     if read(message, "chat_id") != CHAT_ID:
-        return True
+        return owns_text(text) or is_cancel(text)
+    if not (owns_text(text) or is_cancel(text) or gateway().store.reply_batch(message)):
+        return False
     try:
         await adapter._run_blocking(gateway().message, data, text)
     except ValueError as exc:
@@ -475,7 +564,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--publish-entry", action="store_true")
+    parser.add_argument("--parse", action="store_true", help="Preview stdin parsing locally; no database, network, or subscription writes")
     args = parser.parse_args()
+    if args.parse:
+        try:
+            print(json.dumps(parse_message(sys.stdin.read()), ensure_ascii=False, indent=2))
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            raise SystemExit(2)
+        raise SystemExit(0)
     store = Store(os.environ["HERMES_SUBSCRIPTIONS_DB"])
     if args.publish_entry:
         store.notify("menu-entry", entry_card())

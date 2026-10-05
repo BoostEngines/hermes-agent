@@ -17,7 +17,7 @@ def test_real_adapter_admits_text_and_card_without_model(tmp_path, monkeypatch):
     store = s.Store(tmp_path / "tasks.db", now=lambda: now - 1)
     monkeypatch.setattr(s, "_gateway", s.Gateway(store, app_id="app", tenant="tenant", enabled=True))
     header = {"event_id": "sdk-message", "event_type": "im.message.receive_v1", "tenant_key": "tenant", "app_id": "app", "create_time": str(int(now * 1e6))}
-    text = "开通 Max 1 年订阅\nUSLC32EMHS maria.garcia7104@zohomail.com"
+    text = "  请开通以下店铺的ab订阅：  \n  maria.garcia7104@zohomail.com  \n  second@example.com  "
     data = P2ImMessageReceiveV1({"header": header, "event": {"sender": {"sender_type": "user", "sender_id": {"open_id": "ou_developer"}}, "message": {"chat_id": s.CHAT_ID, "chat_type": "group", "message_type": "text", "message_id": "om_sdk", "create_time": str(int(now * 1000)), "content": json.dumps({"text": text})}}})
     adapter = make_adapter_skeleton()
     async def run_blocking(fn, *args):
@@ -26,7 +26,11 @@ def test_real_adapter_admits_text_and_card_without_model(tmp_path, monkeypatch):
     adapter._dispatch_inbound_event = AsyncMock(side_effect=AssertionError("must bypass model"))
     asyncio.run(adapter._process_inbound_message(data=data, message=data.event.message, sender_id=data.event.sender.sender_id, chat_type="group", message_id="om_sdk"))
     with store.connect() as db:
-        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
+    cancel = P2ImMessageReceiveV1({"header": {**header, "event_id": "sdk-cancel"}, "event": {"sender": {"sender_type": "user", "sender_id": {"open_id": "ou_developer"}}, "message": {"chat_id": s.CHAT_ID, "chat_type": "group", "message_type": "text", "message_id": "om_cancel", "parent_id": "om_sdk", "create_time": str(int(now * 1000)), "content": json.dumps({"text": "第二家不对，先等等"})}}})
+    asyncio.run(adapter._process_inbound_message(data=cancel, message=cancel.event.message, sender_id=cancel.event.sender.sender_id, chat_type="group", message_id="om_cancel"))
+    with store.connect() as db:
+        assert db.execute("SELECT count(*) FROM jobs WHERE status='cancelled'").fetchone()[0] == 2
     # A real SDK callback on the persisted entry sends a form, never a grant.
     store.notify("menu-entry", s.entry_card())
     s.Worker(store, deliver=lambda *_: "om_entry").flush()
@@ -46,5 +50,5 @@ def test_real_adapter_admits_text_and_card_without_model(tmp_path, monkeypatch):
         return adapter._on_card_action_trigger(form)
     assert asyncio.run(submit()).toast.content == "已接收，将在本群反馈处理结果。"
     with store.connect() as db:
-        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 3
     adapter._dispatch_inbound_event.assert_not_called()
