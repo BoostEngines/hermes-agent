@@ -870,6 +870,7 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
+    reserved_dm_session: Optional[Dict[str, str]] = None  # One slot inside the global cap
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
     # When True, the default profile's gateway serves inbound messages for every
@@ -1014,6 +1015,7 @@ class GatewayConfig:
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
+            "reserved_dm_session": self.reserved_dm_session,
             "multiplex_profiles": self.multiplex_profiles,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -1113,6 +1115,12 @@ class GatewayConfig:
             max_concurrent_raw,
             max_concurrent_key,
         )
+        from hermes_cli.active_sessions import resolve_reserved_dm_session
+
+        reserved_dm_session = resolve_reserved_dm_session({
+            "max_concurrent_sessions": max_concurrent_sessions,
+            "reserved_dm_session": data.get("reserved_dm_session"),
+        })
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -1148,6 +1156,7 @@ class GatewayConfig:
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             max_concurrent_sessions=max_concurrent_sessions,
+            reserved_dm_session=reserved_dm_session,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
@@ -1310,6 +1319,8 @@ def load_gateway_config() -> GatewayConfig:
 
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
+            if "reserved_dm_session" in yaml_cfg:
+                gw_data["reserved_dm_session"] = yaml_cfg["reserved_dm_session"]
 
             streaming_cfg = yaml_cfg.get("streaming")
             if not isinstance(streaming_cfg, dict) and isinstance(gateway_section, dict):

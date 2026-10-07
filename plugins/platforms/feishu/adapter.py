@@ -3530,6 +3530,8 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
+        # Preserve the SDK sender's app-scoped ID without changing session keys.
+        source.user_id_open = getattr(sender_id, "open_id", None) or None
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
