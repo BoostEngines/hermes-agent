@@ -3034,6 +3034,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     messages to/from the agent.
     """
 
+    supports_webhook_admission = True
+
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
@@ -5558,6 +5560,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "platform": platform,
                     "chat_id": getattr(source, "chat_id", "") or "",
                     "user_id": getattr(source, "user_id", "") or "",
+                    "user_id_alt": getattr(source, "user_id_alt", None),
+                    "user_id_open": getattr(source, "user_id_open", None),
+                    "chat_type": getattr(source, "chat_type", None),
+                    "is_bot": getattr(source, "is_bot", False),
                 },
             )
         except Exception as exc:
@@ -11374,6 +11380,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Refusing new turn for session %s — external drain active.",
                 _quick_key,
             )
+            if event.admission_callback is not None:
+                event.admission_callback(False)
             return (
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "
@@ -11396,6 +11404,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
             )
+            # Report before the adapter sends the human-readable response:
+            # that delivery may take longer than the HTTP admission window.
+            if event.admission_callback is not None:
+                event.admission_callback(False)
             return _limit_message
         if _active_session_lease is not None:
             if not hasattr(self, "_active_session_leases"):
@@ -11407,6 +11419,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            if event.admission_callback is not None:
+                event.admission_callback(True)
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will

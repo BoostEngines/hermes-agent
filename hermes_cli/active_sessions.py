@@ -70,6 +70,22 @@ def resolve_max_concurrent_sessions(config: Any) -> Optional[int]:
     return coerce_max_concurrent_sessions(raw, key=key)
 
 
+def resolve_reserved_dm_session(config: Any) -> Optional[dict[str, str]]:
+    """Reserve one slot for one configured platform/user, with no tool authority."""
+    raw = config.get("reserved_dm_session") if isinstance(config, dict) else getattr(config, "reserved_dm_session", None)
+    if raw is None:
+        return None
+    if (not isinstance(raw, dict) or set(raw) != {"platform", "user_id"}
+            or any(not isinstance(raw[key], str) or not raw[key]
+                   or len(raw[key]) > 256 or any(c.isspace() for c in raw[key])
+                   for key in ("platform", "user_id"))):
+        raise ValueError("reserved_dm_session requires exact platform and user_id strings")
+    limit = resolve_max_concurrent_sessions(config)
+    if limit is None or limit < 2:
+        raise ValueError("reserved_dm_session requires max_concurrent_sessions >= 2")
+    return dict(raw)
+
+
 def active_session_limit_message(active_count: int, max_sessions: int) -> str:
     return (
         f"Hermes is at the active session limit ({active_count}/{max_sessions}). "
@@ -142,18 +158,24 @@ class _FileLock:
             self._fh = None
 
 
-def _read_entries(path: Path) -> list[dict[str, Any]]:
+def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return []
     except Exception:
+        if strict:
+            raise RuntimeError("active session registry is unreadable") from None
         logger.warning("Ignoring corrupt active session registry at %s", path)
         return []
     entries = data.get("entries") if isinstance(data, dict) else data
     if not isinstance(entries, list):
+        if strict:
+            raise RuntimeError("active session registry is invalid")
         return []
+    if strict and any(not isinstance(entry, dict) for entry in entries):
+        raise RuntimeError("active session registry contains invalid entries")
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
@@ -243,56 +265,84 @@ def try_acquire_active_session(
     Returns ``(lease, None)`` on success.  When the cap is disabled, the lease is
     a no-op object so callers can unconditionally call ``release()``.
     """
-    max_sessions = resolve_max_concurrent_sessions(config)
-    lease_id = uuid.uuid4().hex
-    if max_sessions is None:
+    try:
+        max_sessions = resolve_max_concurrent_sessions(config)
+        reserved = resolve_reserved_dm_session(config)
+        lease_id = uuid.uuid4().hex
+        if max_sessions is None:
+            return ActiveSessionLease(
+                lease_id=lease_id,
+                session_id=session_id,
+                surface=surface,
+                enabled=False,
+            ), None
+
+        now = time.time()
+        entry = {
+            "lease_id": lease_id,
+            "session_id": str(session_id),
+            "surface": str(surface),
+            "pid": os.getpid(),
+            "process_start_time": _process_start_time(os.getpid()),
+            "started_at": now,
+            "updated_at": now,
+        }
+        if metadata:
+            entry["metadata"] = {
+                str(k): v for k, v in metadata.items() if isinstance(k, str)
+            }
+
+        state_path = _state_path()
+        with _FileLock(_lock_path()):
+            raw_entries = _read_entries(state_path, strict=reserved is not None)
+            entries = _prune_dead(raw_entries)
+            pruned = len(raw_entries) - len(entries)
+            if pruned:
+                logger.info("Pruned %d stale active session lease(s)", pruned)
+            active_count = len(entries)
+            if reserved is not None:
+                reserved_in_use = any(e.get("reserved_dm") is True for e in entries)
+                trusted = metadata or {}
+                eligible = (
+                    surface == f"gateway:{reserved['platform']}"
+                    and trusted.get("platform") == reserved["platform"]
+                    and trusted.get("chat_type") == "dm"
+                    and trusted.get("is_bot") is False
+                    and reserved["user_id"] in (
+                        trusted.get("user_id"), trusted.get("user_id_alt"), trusted.get("user_id_open"),
+                    )
+                )
+                entry["reserved_dm"] = eligible and not reserved_in_use
+                shared_count = sum(e.get("reserved_dm") is not True for e in entries)
+                if not entry["reserved_dm"] and shared_count >= max_sessions - 1:
+                    return None, (
+                        f"Hermes shared sessions are full ({shared_count}/{max_sessions - 1}); "
+                        "one slot is reserved for the configured private chat. Try again later."
+                    )
+            if active_count >= max_sessions:
+                _write_entries(state_path, entries)
+                logger.info(
+                    "Active session limit reached: active=%d max=%d surface=%s",
+                    active_count,
+                    max_sessions,
+                    surface,
+                )
+                return None, active_session_limit_message(active_count, max_sessions)
+            entries.append(entry)
+            _write_entries(state_path, entries)
+
         return ActiveSessionLease(
             lease_id=lease_id,
-            session_id=session_id,
-            surface=surface,
-            enabled=False,
+            session_id=str(session_id),
+            surface=str(surface),
         ), None
-
-    now = time.time()
-    entry = {
-        "lease_id": lease_id,
-        "session_id": str(session_id),
-        "surface": str(surface),
-        "pid": os.getpid(),
-        "process_start_time": _process_start_time(os.getpid()),
-        "started_at": now,
-        "updated_at": now,
-    }
-    if metadata:
-        entry["metadata"] = {
-            str(k): v for k, v in metadata.items() if isinstance(k, str)
-        }
-
-    state_path = _state_path()
-    with _FileLock(_lock_path()):
-        raw_entries = _read_entries(state_path)
-        entries = _prune_dead(raw_entries)
-        pruned = len(raw_entries) - len(entries)
-        if pruned:
-            logger.info("Pruned %d stale active session lease(s)", pruned)
-        active_count = len(entries)
-        if active_count >= max_sessions:
-            _write_entries(state_path, entries)
-            logger.info(
-                "Active session limit reached: active=%d max=%d surface=%s",
-                active_count,
-                max_sessions,
-                surface,
-            )
-            return None, active_session_limit_message(active_count, max_sessions)
-        entries.append(entry)
-        _write_entries(state_path, entries)
-
-    return ActiveSessionLease(
-        lease_id=lease_id,
-        session_id=str(session_id),
-        surface=str(surface),
-    ), None
+    except Exception as exc:
+        raw = config.get("reserved_dm_session") if isinstance(config, dict) else getattr(config, "reserved_dm_session", None)
+        if raw is None:
+            raise
+        # Every caller (gateway, CLI and TUI) must reject an untracked turn.
+        logger.warning("Reserved session admission unavailable: %s", exc)
+        return None, "Hermes session capacity is temporarily unavailable. Please retry."
 
 
 def release_active_session(lease: ActiveSessionLease) -> None:

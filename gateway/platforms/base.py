@@ -1773,6 +1773,10 @@ class MessageEvent:
     raw_message: Any = None
     message_id: Optional[str] = None
 
+    # In-process transport receipt, never populated from incoming payloads.
+    # True means the runner reserved a session slot, not that the run succeeded.
+    admission_callback: Optional[Callable[[bool], None]] = field(default=None, repr=False, compare=False)
+
     # Platform-specific update identifier.  For Telegram this is the
     # ``update_id`` from the PTB Update wrapper; other platforms currently
     # ignore it.  Used by ``/restart`` to record the triggering update so the

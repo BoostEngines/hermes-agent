@@ -105,6 +105,7 @@ def test_new_session_gets_clean_error_at_active_session_limit(monkeypatch):
     _occupy_session(runner, "busy")
     event = _make_event(chat_id="new")
     new_key = build_session_key(event.source)
+    event.admission_callback = MagicMock()
 
     async def fail_if_agent_runs(self_inner, ev, src, qk, generation):
         raise AssertionError("_handle_message_with_agent should not run at capacity")
@@ -117,7 +118,48 @@ def test_new_session_gets_clean_error_at_active_session_limit(monkeypatch):
         "Try again when another session finishes."
     )
     assert new_key not in runner._running_agents
+    event.admission_callback.assert_called_once_with(False)
     runner.session_store.get_or_create_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_webhook_capacity_receipt_precedes_slow_response_delivery(monkeypatch):
+    from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+    import json
+
+    _silence_global_gateway_hooks(monkeypatch)
+    runner = _make_runner(max_concurrent_sessions=1)
+    _occupy_session(runner, "busy")
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={
+        "routes": {"alerts": {"secret": _INSECURE_NO_AUTH, "prompt": "{message}"}},
+    }))
+    runner.adapters[Platform.WEBHOOK] = adapter
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(runner._handle_message)
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def slow_send(*args, **kwargs):
+        await release.wait()
+        finished.set()
+        return None
+
+    adapter.send = slow_send
+    req = MagicMock()
+    req.headers = {"X-Request-ID": "capacity-slow-delivery"}
+    req.match_info = {"route_name": "alerts"}
+    req.method = "POST"
+    body = b'{"message":"recover"}'
+    req.content_length = len(body)
+    req.read = AsyncMock(return_value=body)
+    try:
+        response = await asyncio.wait_for(adapter._handle_webhook(req), 5)
+        assert response.status == 429
+        assert json.loads(response.text)["error"] == "agent_not_admitted"
+        assert not finished.is_set()
+    finally:
+        release.set()
+        await asyncio.wait_for(finished.wait(), 5)
 
 
 def test_existing_active_session_uses_busy_handling_at_limit(monkeypatch):
@@ -147,6 +189,7 @@ def test_new_session_can_start_after_active_session_released(monkeypatch):
     event = _make_event(chat_id="new")
 
     sentinel_seen = False
+    event.admission_callback = MagicMock()
 
     async def mock_agent_run(self_inner, ev, src, qk, generation):
         nonlocal sentinel_seen
@@ -158,6 +201,7 @@ def test_new_session_can_start_after_active_session_released(monkeypatch):
 
     assert result == "ok"
     assert sentinel_seen is True
+    event.admission_callback.assert_called_once_with(True)
 
 
 def test_status_command_bypasses_active_session_limit(monkeypatch):
