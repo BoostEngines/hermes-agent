@@ -614,6 +614,12 @@ session_reset:
 # local runtime lease registry cannot be read or locked.
 max_concurrent_sessions: null
 
+# Optional: keep one slot inside the cap for one user's private chat.
+# Requires max_concurrent_sessions >= 2. Other sessions use at most cap - 1.
+# Uses platform event IDs, never message text; grants no extra tool permissions.
+# Registry failures reject new sessions while this reservation is configured.
+reserved_dm_session: null  # e.g. {platform: feishu, user_id: ou_your_open_id}
+
 # When true, group/channel chats use one session per participant when the platform
 # provides a user ID. This is the secure default and prevents users in the same
 # room from sharing context, interrupts, and token costs. Set false only if you

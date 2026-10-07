@@ -5560,6 +5560,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "platform": platform,
                     "chat_id": getattr(source, "chat_id", "") or "",
                     "user_id": getattr(source, "user_id", "") or "",
+                    "user_id_alt": getattr(source, "user_id_alt", None),
+                    "user_id_open": getattr(source, "user_id_open", None),
+                    "chat_type": getattr(source, "chat_type", None),
+                    "is_bot": getattr(source, "is_bot", False),
                 },
             )
         except Exception as exc:

@@ -164,6 +164,7 @@ class SessionSource:
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
+    user_id_open: Optional[str] = None  # Verified app-scoped ID when primary is tenant-scoped (Feishu)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
     is_bot: bool = False  # True when the message author is a bot/webhook (Discord)
     # Platform-neutral SCOPE discriminator (Discord guild / Slack workspace /
@@ -248,6 +249,10 @@ class SessionSource:
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
+        if self.user_id_open:
+            d["user_id_open"] = self.user_id_open
+        if self.is_bot:
+            d["is_bot"] = True
         if self.chat_id_alt:
             d["chat_id_alt"] = self.chat_id_alt
         # D-Q2.5 dual-write: emit BOTH the canonical `scope_id` and the
@@ -282,6 +287,8 @@ class SessionSource:
             thread_id=data.get("thread_id"),
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
+            user_id_open=data.get("user_id_open"),
+            is_bot=data.get("is_bot", False),
             chat_id_alt=data.get("chat_id_alt"),
             # D-Q2.5 dual-read: prefer the canonical `scope_id`, fall back to the
             # deprecated `guild_id` alias (a peer not yet migrated still sends it).

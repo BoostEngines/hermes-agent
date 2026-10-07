@@ -1765,6 +1765,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(event.source.user_id, "u_user")  # tenant-scoped user_id preferred over app-scoped open_id
         self.assertEqual(event.source.user_name, "张三")
         self.assertEqual(event.source.user_id_alt, "on_union")
+        self.assertEqual(event.source.user_id_open, "ou_user")
         self.assertEqual(event.source.chat_name, "Feishu DM")
 
     @patch.dict(os.environ, {}, clear=True)
